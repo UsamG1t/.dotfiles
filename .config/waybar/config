@@ -1,0 +1,83 @@
+{
+  "layer": "top",
+  "position": "top",
+  "height": 28,
+
+  "modules-left": [
+    "hyprland/workspaces"
+  ],
+
+  "modules-center": [
+    "clock"
+  ],
+
+  "modules-right": [
+    "custom/notifications",
+    "bluetooth",
+    "network",
+    "battery",
+    "tray"
+  ],
+
+  "hyprland/workspaces": {
+    "format": "{icon}",
+    "on-click": "activate",
+    "format-icons": {
+      "1": " Main 1",
+      "2": " Social 2",
+      "3": " Code 3",
+      "4": " Virtual 4",
+      "5": "󰒓 Terminal 5",
+      "6": "󰈙 Docs 6",
+      "7": " Other 7",
+      "8": "Ext1 8",
+      "9": "Ext2 9"
+    }
+  },
+
+  "clock": {
+    "format": "{:%H:%M}",
+    "tooltip-format": "{:%A, %d %B %Y}",
+    "on-click": "calendar-popup"
+  },
+
+  "bluetooth": {
+    "format-off":       "󰂲  Off",
+    "format-on":        "󰂯",
+    "format-connected": "󰂱  {device_alias}",
+    "format-connected-battery": "󰂱  {device_alias} {device_battery_percentage}%",
+    "tooltip-format":           "Bluetooth: {status}",
+    "tooltip-format-connected": "{device_enumerate}",
+    "tooltip-format-enumerate-connected":         "{device_alias}",
+    "tooltip-format-enumerate-connected-battery": "{device_alias}  {device_battery_percentage}%",
+    "on-click": "toggle-bluetooth"
+  },
+
+  "network": {
+    "format-wifi":        "󰤨  {essid}",
+    "format-ethernet":    "󰈀  wired",
+    "format-disconnected":"󰤯  Disconnected",
+    "format-off":         "󰤭  Off",
+    "tooltip-format": "{ifname}\n{ipaddr}/{cidr}\n{signalStrength}%",
+    "on-click": "kitty --class nmtui-popup --title 'Network' nmtui"
+  },
+
+  "battery": {
+    "format":          "{capacity}% {icon}",
+    "format-charging": "{capacity}% 󰂄",
+    "format-icons": ["󰁺", "󰁻", "󰁼", "󰁽", "󰁾", "󰁿", "󰂀", "󰂁", "󰂂", "󰁹"]
+  },
+
+  "custom/notifications": {
+    "format": "{}",
+    "return-type": "json",
+    "exec": "notifications-status",
+    "on-click": "swaync-client -t -sw",
+    "escape": true
+  },
+
+  "tray": {
+    "icon-size": 16,
+    "spacing": 8
+  }
+}

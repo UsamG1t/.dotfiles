@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# notifications-status — непрерывный JSON-стрим для waybar от swaync
+# Waybar ждёт живой процесс — скрипт не должен завершаться
+
+if ! command -v swaync-client &>/dev/null; then
+    printf '{"text":"󰇯","class":"none","tooltip":"swaync не установлен"}\n'
+    sleep infinity
+    exit 0
+fi
+
+swaync-client -swb | while IFS= read -r line; do
+    count=$(printf '%s\n' "$line" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    print(d.get('text', '0'))
+except Exception:
+    print('0')
+" 2>/dev/null)
+    count="${count:-0}"
+
+    if [ "$count" = "0" ] || [ -z "$count" ]; then
+        printf '{"text":"󰇯","class":"none","tooltip":"Нет уведомлений"}\n'
+    else
+        printf '{"text":"󰇮 (%s)","class":"notification","tooltip":"%s уведомлений"}\n' \
+            "$count" "$count"
+    fi
+done

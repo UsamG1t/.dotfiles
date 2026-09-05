@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# toggle-scratchpad — Super+Shift+S
+# Если окно в скрэтчпаде → вернуть на текущий воркспейс
+# Если нет → отправить в скрэтчпад
+
+WS=$(hyprctl activewindow -j 2>/dev/null | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+print(d['workspace']['name'])
+" 2>/dev/null)
+
+if [ "$WS" = "special:magic" ]; then
+    hyprctl dispatch movetoworkspace current
+else
+    hyprctl dispatch movetoworkspace special:magic
+fi

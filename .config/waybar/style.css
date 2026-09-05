@@ -1,0 +1,68 @@
+* {
+    font-family: monospace;
+    font-size: 13px;
+    border: none;
+    border-radius: 0;
+    min-height: 0;
+}
+
+window#waybar {
+    background: rgba(20, 20, 20, 0.90);
+    color: #e0e0e0;
+}
+
+#workspaces button {
+    padding: 0 8px;
+    color: #666666;
+    background: transparent;
+}
+
+#workspaces button.active {
+    color: #D4A020;
+    background: rgba(212, 160, 32, 0.12);
+}
+
+#workspaces button:hover {
+    background: rgba(212, 160, 32, 0.07);
+}
+
+#clock,
+#network,
+#battery,
+#tray, 
+#custom-notifications {
+    padding: 0 10px;
+}
+ 
+#clock:hover,
+#network:hover,
+#custom-notifications:hover {
+    background: rgba(255, 255, 255, 0.07);
+}
+ 
+#custom-notifications.none {
+    color: #666666;
+}
+ 
+#custom-notifications.notification {
+    color: #9333EA;
+}
+
+#bluetooth {
+    padding: 0 10px;
+}
+
+#bluetooth:hover {
+    background: rgba(255, 255, 255, 0.07);
+}
+
+/* Подключено — охра */
+#bluetooth.connected {
+    color: #D4A020;
+}
+
+/* Выключено — приглушённый */
+#bluetooth.off,
+#bluetooth.disabled {
+    color: #666666;
+}

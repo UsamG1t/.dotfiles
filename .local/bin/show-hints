@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# show-hints — toggle the keybind hints overlay
+#
+# Install:
+#   cp show-hints ~/.local/bin/show-hints
+#   chmod +x ~/.local/bin/show-hints
+#
+# Called by Hyprland bind: Super+?
+# NeoVim config expected at: ~/.config/nvim-hint/init.lua
+
+MODULES="$HOME/.config/hypr/modules"
+HINT_FILE="$MODULES/keyhints.txt"
+LUA_FILE="$MODULES/keybinds.lua"
+GEN_PY="$MODULES/keybinds_gen.py"
+
+# ── Toggle: close if the overlay is already open ──────────────────────────────
+if hyprctl clients -j 2>/dev/null | grep -qE '"class"\s*:\s*"keyhint"'; then
+    hyprctl dispatch closewindow class:keyhint
+    exit 0
+fi
+
+# ── Rebuild hint file when keybinds.lua is newer (or file missing) ────────────
+if [[ ! -f "$HINT_FILE" || "$LUA_FILE" -nt "$HINT_FILE" ]]; then
+    python3 "$GEN_PY" "$LUA_FILE" "$HINT_FILE"
+fi
+
+# ── Open hints in NeoVim with the dedicated minimal config ────────────────────
+# NVIM_APPNAME redirects NeoVim to ~/.config/nvim-hint/ instead of ~/.config/nvim/
+NVIM_APPNAME=nvim-hint kitty \
+    --class  keyhint      \
+    --title  "Keybind Hints" \
+    nvim -R "$HINT_FILE"

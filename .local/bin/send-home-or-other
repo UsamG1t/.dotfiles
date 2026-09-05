@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# send-home-or-other — Super+Shift+O
+# Если активное окно на Other (7) → отправить на его домашний воркспейс по классу
+# Если не на Other → отправить на Other
+#
+# Install: cp send-home-or-other ~/.local/bin/ && chmod +x ~/.local/bin/send-home-or-other
+
+OTHER_WS=7
+
+# Маппинг класса → домашний воркспейс (должен совпадать с rules.lua)
+home_workspace() {
+    case "$1" in
+        firefox|Firefox)          echo 2 ;;
+        org.telegram.desktop)     echo 2 ;;
+        thunderbird|Thunderbird)  echo 2 ;;
+        code-oss)                 echo 3 ;;
+        org.kde.kate)             echo 3 ;;
+        "VirtualBox Manager")     echo 4 ;;
+        virt-manager)             echo 4 ;;
+        kitty-yazi)               echo 5 ;;
+        kitty-terminal)           echo 5 ;;
+        *)                        echo "" ;;   # неизвестный класс
+    esac
+}
+
+DATA=$(hyprctl activewindow -j | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+print(d['workspace']['id'])
+print(d['class'])
+")
+
+CURRENT_WS=$(echo "$DATA" | head -1)
+CLASS=$(echo "$DATA" | tail -1)
+
+if [ "$CURRENT_WS" = "$OTHER_WS" ]; then
+    HOME=$(home_workspace "$CLASS")
+    if [ -n "$HOME" ]; then
+        hyprctl dispatch movetoworkspace "$HOME"
+    fi
+    # Если класс неизвестен — окно остаётся на Other
+else
+    hyprctl dispatch movetoworkspace "$OTHER_WS"
+fi

@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# lock-screen — переключить на английскую раскладку и заблокировать экран
+# Install: cp lock-screen ~/.local/bin/ && chmod +x ~/.local/bin/lock-screen
+
+# Не запускать второй экземпляр если уже заблокировано
+pidof hyprlock && exit 0
+
+# Переключить на первую раскладку (us) перед блокировкой
+hyprctl switchxkblayout all 0
+
+hyprlock

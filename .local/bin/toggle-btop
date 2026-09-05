@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# toggle-btop — toggle the system monitor (btop inside kitty)
+#
+# Install:
+#   cp toggle-btop ~/.local/bin/toggle-btop
+#   chmod +x ~/.local/bin/toggle-btop
+
+CLASS="kitty-btop"
+
+if hyprctl clients -j 2>/dev/null | grep -qE '"class"\s*:\s*"'"$CLASS"'"'; then
+    hyprctl dispatch closewindow "class:$CLASS"
+else
+    kitty \
+        --class "$CLASS" \
+        -o initial_window_width=82c  \
+        -o initial_window_height=26c \
+        btop
+fi

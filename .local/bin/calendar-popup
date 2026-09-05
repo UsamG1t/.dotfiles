@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# calendar-popup — toggle clock/calendar overlay
+# Install: cp calendar-popup ~/.local/bin/ && chmod +x ~/.local/bin/calendar-popup
+
+CLASS="calendar-popup"
+
+if hyprctl clients -j 2>/dev/null | grep -qE '"class"\s*:\s*"'"$CLASS"'"'; then
+    hyprctl dispatch closewindow "class:$CLASS"
+    exit 0
+fi
+
+kitty \
+    --class "$CLASS" \
+    --title "Calendar" \
+    -o initial_window_width=26c \
+    -o initial_window_height=14c \
+    bash -c '
+while true; do
+    clear
+    printf "\n"
+    date "+   %A"
+    date "+   %d %B %Y"
+    printf "\n"
+    date "+   %H:%M:%S"
+    printf "\n"
+    cal
+    sleep 1
+done'

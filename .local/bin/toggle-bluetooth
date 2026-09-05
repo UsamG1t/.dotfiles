@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# toggle-bluetooth — открыть/закрыть TUI управления bluetooth
+# Install: cp toggle-bluetooth ~/.local/bin/ && chmod +x ~/.local/bin/toggle-bluetooth
+
+CLASS="bluetooth-popup"
+
+if hyprctl clients -j 2>/dev/null | grep -qE '"class"\s*:\s*"'"$CLASS"'"'; then
+    hyprctl dispatch closewindow "class:$CLASS"
+    exit 0
+fi
+
+# Включаем bluetooth если выключен
+bluetoothctl power on 2>/dev/null
+
+# Открываем TUI (bluetuith из AUR; запасной — blueman-manager)
+if command -v bluetuith &>/dev/null; then
+    kitty --class "$CLASS" --title "Bluetooth" bluetuith
+else
+    # fallback: bluetoothctl в интерактивном режиме
+    kitty --class "$CLASS" --title "Bluetooth" bluetoothctl
+fi

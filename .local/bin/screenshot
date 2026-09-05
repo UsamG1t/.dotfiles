@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# screenshot — интерактивный снимок экрана
+# Depends: grim, slurp, wl-clipboard, wofi, libnotify (notify-send)
+# Install: cp screenshot ~/.local/bin/ && chmod +x ~/.local/bin/screenshot
+
+SAVE_DIR="$HOME/Pictures/Screenshots"
+TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
+TMPFILE="/tmp/screenshot_$TIMESTAMP.png"
+SAVEFILE="$SAVE_DIR/screenshot_$TIMESTAMP.png"
+
+mkdir -p "$SAVE_DIR"
+
+# Геометрия активного окна снимается ДО открытия wofi —
+# пока фокус ещё не ушёл в меню
+ACTIVE_GEOM=$(hyprctl activewindow -j 2>/dev/null | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+x, y = d['at']
+w, h = d['size']
+print(f'{x},{y} {w}x{h}')
+" 2>/dev/null)
+
+# ── Тип снимка ────────────────────────────────────────────────────────────────
+MODE=$(printf "Screen\nWindow\nArea" | \
+    wofi --dmenu --prompt "Screenshot" --lines 3 --width 220 --height 135)
+[ -z "$MODE" ] && exit 0
+
+# ── Действие ──────────────────────────────────────────────────────────────────
+ACTION=$(printf "Copy\nSave\nBoth" | \
+    wofi --dmenu --prompt "Action" --lines 3 --width 220 --height 135)
+[ -z "$ACTION" ] && exit 0
+
+# ── Захват ────────────────────────────────────────────────────────────────────
+case "$MODE" in
+    Screen)
+        grim "$TMPFILE"
+        ;;
+    Window)
+        if [ -z "$ACTIVE_GEOM" ]; then
+            notify-send "Screenshot" "Не удалось определить активное окно" --urgency=low
+            exit 1
+        fi
+        grim -g "$ACTIVE_GEOM" "$TMPFILE"
+        ;;
+    Area)
+        sleep 0.2   # подождать закрытия wofi перед slurp
+        GEOM=$(slurp)
+        [ -z "$GEOM" ] && exit 0
+        grim -g "$GEOM" "$TMPFILE"
+        ;;
+esac
+
+# ── Результат ─────────────────────────────────────────────────────────────────
+case "$ACTION" in
+    Copy)
+        wl-copy --type image/png < "$TMPFILE"
+        rm "$TMPFILE"
+        notify-send "Screenshot" "Скопирован в буфер" --urgency=low
+        ;;
+    Save)
+        mv "$TMPFILE" "$SAVEFILE"
+        notify-send "Screenshot сохранён" "$(basename "$SAVEFILE")" --urgency=low
+        ;;
+    Both)
+        wl-copy --type image/png < "$TMPFILE"
+        mv "$TMPFILE" "$SAVEFILE"
+        notify-send "Screenshot сохранён и скопирован" "$(basename "$SAVEFILE")" --urgency=low
+        ;;
+esac

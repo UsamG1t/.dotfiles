@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# thunderbird-here — Super+Ctrl+T
+# Переносит существующее окно Thunderbird на текущий воркспейс.
+# Если Thunderbird не запущен — открывает его (окно уйдёт на ws2 через правило).
+#
+# Install: cp thunderbird-here ~/.local/bin/ && chmod +x ~/.local/bin/thunderbird-here
+
+TARGET_WS=$(hyprctl activeworkspace -j | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+
+if hyprctl clients -j 2>/dev/null | python3 -c "
+import sys, json
+clients = json.load(sys.stdin)
+exit(0 if any(c.get('class','').lower() == 'thunderbird' for c in clients) else 1)
+"; then
+    hyprctl dispatch movetoworkspace "$TARGET_WS,class:thunderbird"
+else
+    thunderbird &
+fi

@@ -1,0 +1,88 @@
+# ~/.config/yazi/theme.toml
+# yazi v26+ — правильные названия секций
+# Палитра: фон/выделение — фиолетовый #9333EA, разделители — охра #D4A020
+
+[mgr]
+cwd           = { fg = "#D4A020", bold = true }
+hovered       = { fg = "#ffffff", bg = "#9333EA" }
+border_symbol = "│"
+border_style  = { fg = "#D4A020" }
+
+[mode]
+normal_main = { fg = "#ffffff", bg = "#9333EA", bold = true }
+normal_alt  = { fg = "#9333EA", bg = "#141414" }
+select_main = { fg = "#141414", bg = "#D4A020", bold = true }
+select_alt  = { fg = "#D4A020", bg = "#141414" }
+unset_main  = { fg = "#141414", bg = "#666666", bold = true }
+unset_alt   = { fg = "#666666", bg = "#141414" }
+
+[status]
+perm_type  = { fg = "#666666" }
+perm_read  = { fg = "#D4A020" }
+perm_write = { fg = "#9333EA" }
+perm_exec  = { fg = "#4caf50" }
+perm_sep   = { fg = "#4a4a4a" }
+
+progress_label  = { bold = true }
+progress_normal = { fg = "#9333EA" }
+progress_error  = { fg = "#ff6b6b" }
+
+[input]
+border   = { fg = "#9333EA" }
+title    = { fg = "#D4A020", bold = true }
+value    = { fg = "#e0e0e0" }
+selected = { reversed = true }
+
+[cmp]
+border   = { fg = "#9333EA" }
+active   = { bg = "#9333EA" }
+inactive = {}
+
+[tasks]
+border  = { fg = "#D4A020" }
+hovered = { underline = true }
+
+[which]
+mask            = { bg = "#141414" }
+cand            = { fg = "#9333EA" }
+rest            = { fg = "#666666" }
+desc            = { fg = "#D4A020" }
+separator       = "  "
+separator_style = { fg = "#4a4a4a" }
+
+[notify]
+title_info  = { fg = "#9333EA" }
+title_warn  = { fg = "#D4A020" }
+title_error = { fg = "#ff6b6b" }
+
+[filetype]
+rules = [
+  # Директории — url = "*/" (правильный синтаксис v26)
+  { url = "*/",             fg = "#D4A020", bold = true },
+
+  # Симлинки
+  { mime = "inode/symlink", fg = "#66ccff"              },
+
+  # Изображения — фиолетовый
+  { mime = "image/*",       fg = "#9333EA"              },
+
+  # Видео и аудио — охра
+  { mime = "video/*",       fg = "#D4A020"              },
+  { mime = "audio/*",       fg = "#D4A020"              },
+
+  # Документы
+  { mime = "application/pdf", fg = "#e0e0e0"            },
+
+  # Архивы — серый
+  { mime = "application/zip",              fg = "#888888" },
+  { mime = "application/gzip",             fg = "#888888" },
+  { mime = "application/x-tar",            fg = "#888888" },
+  { mime = "application/x-7z-compressed",  fg = "#888888" },
+  { mime = "application/x-rar",            fg = "#888888" },
+
+  # Исполняемые — зелёный (url + is = "exec" — правильный синтаксис)
+  { url = "*", is = "exec", fg = "#4caf50", bold = true  },
+
+  # Остальное
+  { url = "*",              fg = "#e0e0e0"              },
+]

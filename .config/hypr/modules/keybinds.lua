@@ -9,10 +9,12 @@ hl.bind(mainMod .. " + E",              hl.dsp.exec_cmd(apps.yazi))            -
 hl.bind(mainMod .. " + CTRL + E",       hl.dsp.exec_cmd(apps.yazi_local))     -- File manager → here
 hl.bind(mainMod .. " + F",              hl.dsp.exec_cmd(apps.browser))         -- Browser → workspace
 hl.bind(mainMod .. " + CTRL + F",       hl.dsp.exec_cmd("firefox-here"))       -- Browser → here
+hl.bind(mainMod .. " + T",        hl.dsp.exec_cmd(apps.mail))              -- Mail → workspace
+hl.bind(mainMod .. " + CTRL + T", hl.dsp.exec_cmd("thunderbird-here"))     -- Mail → here
 hl.bind(mainMod .. " + bracketright",            hl.dsp.exec_cmd(apps.editor))        -- Editor → workspace
 hl.bind(mainMod .. " + CTRL + bracketright",     hl.dsp.exec_cmd(apps.editor_local))  -- Editor → here
 hl.bind(mainMod .. " + bracketleft",            hl.dsp.exec_cmd(apps.texter))        -- Sublime → workspace
-hl.bind(mainMod .. " + CTRL + bracketleft",     hl.dsp.exec_cmd(apps.texter_local))  -- Sublime → here
+hl.bind(mainMod .. " + CTRL + bracketleft",     hl.dsp.exec_cmd("sublime-here"))  -- Sublime → here
 hl.bind(mainMod .. " + R",              hl.dsp.exec_cmd(apps.menu))            -- App launcher
 hl.bind(mainMod .. " + CTRL + I",       hl.dsp.exec_cmd("toggle-btop"))        -- Toggle system monitor
 

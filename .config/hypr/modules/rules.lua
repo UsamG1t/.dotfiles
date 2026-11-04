@@ -30,7 +30,7 @@ workspace = workspaces.code,
 
 hl.window_rule({
 name  = "subl-to-code",
-match = { class = "subl" },
+match = { class = "sublime_text" },
 workspace = workspaces.code,
 })
 

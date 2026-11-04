@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+"""
+Скрипт для конвертации Markdown-файла в PDF с помощью пакета markdown-pdf.
+Использование: python My_md2pdf.py <путь_к_файлу.md>
+"""
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+# Убедитесь, что библиотека установлена:
+# pip install markdown-pdf
+from markdown_pdf import MarkdownPdf, Section
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Конвертация Markdown-файла в PDF (формат вывода: то же имя, расширение .pdf)"
+    )
+    parser.add_argument(
+        "input_file",
+        help="Путь к входному Markdown-файлу (например, document.md)"
+    )
+    args = parser.parse_args()
+
+    input_path = Path(args.input_file).resolve()
+
+    # Проверяем существование файла
+    if not input_path.is_file():
+        print(f"Ошибка: файл '{input_path}' не найден.", file=sys.stderr)
+        sys.exit(1)
+
+    # Проверяем расширение (необязательно, но полезно)
+    if input_path.suffix.lower() != ".md":
+        print("Предупреждение: расширение файла не '.md'. Продолжаем...", file=sys.stderr)
+
+    # Читаем Markdown-содержимое
+    try:
+        with open(input_path, "r", encoding="utf-8") as f:
+            markdown_text = f.read()
+    except Exception as e:
+        print(f"Ошибка при чтении файла: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Создаём PDF-объект (можно настроить toc_level, optimize и т.д.)
+    pdf = MarkdownPdf(toc_level=2, optimize=True)
+
+    # Добавляем содержимое как одну секцию
+    pdf.add_section(Section(markdown_text))
+
+    # Формируем имя выходного файла: та же директория, то же имя, но .pdf
+    output_path = input_path.with_suffix(".pdf")
+
+    # Сохраняем PDF
+    try:
+        pdf.save(str(output_path))
+    except Exception as e:
+        print(f"Ошибка при сохранении PDF: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"PDF успешно создан: {output_path}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# sublime-here — Super+Ctrl+[
+# Переносит существующее окно Sublime Text на текущий воркспейс.
+# Если Sublime не запущен — открывает его (окно уйдёт на ws3 через правило).
+#
+# Install: cp sublime-here ~/.local/bin/ && chmod +x ~/.local/bin/sublime-here
+
+TARGET_WS=$(hyprctl activeworkspace -j | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+
+if hyprctl clients -j 2>/dev/null | python3 -c "
+import sys, json
+clients = json.load(sys.stdin)
+exit(0 if any(c.get('class','').lower() == 'sublime_text' for c in clients) else 1)
+"; then
+    hyprctl dispatch movetoworkspace "$TARGET_WS,class:sublime_text"
+else
+    subl &
+fi

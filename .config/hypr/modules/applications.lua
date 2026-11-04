@@ -6,12 +6,12 @@ terminal_ws  = "kitty --class kitty-terminal",
 yazi         = "kitty --class kitty-yazi yazi",
 yazi_local   = "kitty --class kitty-yazi-local yazi",
 browser      = "firefox",
+mail	     = "thunderbird",
 menu         = "wofi --show drun",
 monitor      = "kitty --class kitty-btop -o initial_window_width=82c -o initial_window_height=26c btop",
 editor       = "code-oss",
 editor_local = "code-oss --class code-local",
 texter       = "subl",
-texter_local = "subl --class subl-local",
 }
 
 workspaces = {

@@ -14,6 +14,7 @@ home_workspace() {
         org.telegram.desktop)     echo 2 ;;
         thunderbird|Thunderbird)  echo 2 ;;
         code-oss)                 echo 3 ;;
+        sublime_text)             echo 3 ;;
         org.kde.kate)             echo 3 ;;
         "VirtualBox Manager")     echo 4 ;;
         virt-manager)             echo 4 ;;

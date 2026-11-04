@@ -1,5 +1,11 @@
 ^setup$
 ^sddm$
+^stow-all$
+^packages\.md$
+^\.git$
+^\.agents$
+^\.aws$
+^\.codex$
 ^\.zshrc\.local$
 ^\.gitignore$
 ^CLAUDE\.md$

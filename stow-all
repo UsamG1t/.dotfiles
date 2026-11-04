@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+Использование: ./stow-all [--dry-run]
+
+Разворачивает домашние настройки и два пакета SDDM.
+  -n, --dry-run  Проверить все направления без изменений и без sudo.
+  -h, --help     Показать справку.
+
+Запускайте от обычного пользователя; для системных ссылок вызывается sudo.
+Конфликтующие файлы нужно заранее сохранить и убрать с целевых путей.
+Тема SDDM, её фон и доступ пользователя sddm к репозиторию должны быть готовы.
+EOF
+}
+
+die() {
+    printf 'stow-all: %s\n' "$*" >&2
+    exit 1
+}
+
+dry_run=0
+for arg in "$@"; do
+    case "$arg" in
+        -n|--dry-run) dry_run=1 ;;
+        -h|--help) usage; exit 0 ;;
+        *) usage >&2; die "Неизвестный аргумент: $arg" ;;
+    esac
+done
+
+(( EUID != 0 )) || die 'Запустите скрипт без sudo, от владельца домашних настроек.'
+command -v stow >/dev/null || die 'Не установлен пакет stow.'
+
+# Resolve the repository independently of the current working directory.
+repo_dir=$(dirname -- "$(realpath -e -- "${BASH_SOURCE[0]}")")
+home_target=$(realpath -e -- "$HOME")
+sddm_config=/etc/sddm.conf.d
+sddm_theme=/usr/share/sddm/themes/sddm-astronaut-theme
+common=(--restow --no-folding --verbose=1)
+
+[[ "$repo_dir" != "$home_target" ]] || die 'Репозиторий должен находиться в отдельном каталоге.'
+[[ -d "$sddm_config" ]] || die "Не найден каталог $sddm_config."
+[[ -d "$sddm_theme/Themes" ]] || die 'Установите sddm-astronaut-theme.'
+[[ -f "$sddm_theme/Backgrounds/Fantasy-Medieval_Travern.png" ]] ||
+    die "Не найден фон $sddm_theme/Backgrounds/Fantasy-Medieval_Travern.png."
+grep -Eq '^[[:space:]]*ConfigFile[[:space:]]*=[[:space:]]*Themes/hyprland_custom\.conf[[:space:]]*$' \
+    "$sddm_theme/metadata.desktop" ||
+    die "Укажите ConfigFile=Themes/hyprland_custom.conf в $sddm_theme/metadata.desktop."
+
+stow_home() {
+    stow "${common[@]}" --dir="$repo_dir" --target="$home_target" "$@" .
+}
+
+stow_sddm_config() {
+    stow "${common[@]}" --dir="$repo_dir/sddm" --target="$sddm_config" "$@" config
+}
+
+stow_sddm_theme() {
+    stow "${common[@]}" --dir="$repo_dir/sddm" --target="$sddm_theme/Themes" "$@" theme
+}
+
+# Check every target before changing any of them. Never adopt installed files
+# into the repository: --adopt could overwrite the reviewed configurations.
+failed=0
+stow_home --simulate || failed=1
+stow_sddm_config --simulate || failed=1
+stow_sddm_theme --simulate || failed=1
+(( failed == 0 )) || die 'Предварительная проверка Stow не прошла; изменения не применены.'
+
+if (( dry_run )); then
+    printf 'Проверка Stow завершена; файлы и права доступа не изменены.\n'
+    exit 0
+fi
+
+# Obtain credentials and verify greeter access before applying the home package.
+command -v sudo >/dev/null || die 'Не установлен пакет sudo.'
+sudo -v
+for source in "$repo_dir/sddm/config/theme.conf" "$repo_dir/sddm/theme/hyprland_custom.conf"; do
+    sudo -u sddm -- test -r "$source" ||
+        die "Пользователь sddm не может прочитать $source. Настройте доступ к репозиторию (например, ACL)."
+done
+
+stow_home
+sudo -- stow "${common[@]}" --dir="$repo_dir/sddm" --target="$sddm_config" config
+sudo -- stow "${common[@]}" --dir="$repo_dir/sddm" --target="$sddm_theme/Themes" theme

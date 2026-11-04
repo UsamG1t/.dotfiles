@@ -1,5 +1,6 @@
 ^setup$
 ^sddm$
+^\.zshrc\.local$
 ^\.gitignore$
 ^CLAUDE\.md$
 ^README\.md$

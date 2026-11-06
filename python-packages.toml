@@ -1,0 +1,16 @@
+[environment]
+path = "~/.usamg1t"
+
+[packages]
+requirements = [
+    "markdown-pdf",
+    # "package-name>=1.0",
+    # "package-name @ https://example.com/package_name-1.0-py3-none-any.whl",
+    # "package-name @ git+https://github.com/owner/repository.git@COMMIT",
+    # "./local-project",  # Paths are relative to this manifest.
+]
+
+[[packages.wheel_directories]]
+name = "pysnap"
+url = "https://github.com/UsamG1t/NeuroPysnap/tree/master/dist"
+# prerelease = true  # Include release candidates and development versions.

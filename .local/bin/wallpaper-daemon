@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# wallpaper-daemon — плавная цикличная смена обоев через swww
+# wallpaper-daemon — плавная цикличная смена обоев через awww
 # Install: cp wallpaper-daemon ~/.local/bin/ && chmod +x ~/.local/bin/wallpaper-daemon
 
 WALLPAPER_DIR="$HOME/Pictures/Wallpapers"
@@ -7,14 +7,14 @@ INTERVAL=1800        # секунды между сменой (1800 = 30 мин�
 TRANSITION="fade"    # fade | wipe | wave | grow | random
 DURATION=2           # длительность анимации перехода в секундах
 
-# Ждём пока swww-daemon будет готов
+# Ждём пока awww-daemon будет готов
 until awww query &>/dev/null; do
     sleep 0.5
 done
 
 # Собираем список изображений
 mapfile -t IMAGES < <(
-    find "$WALLPAPER_DIR" -maxdepth 1 -type f \
+    find -L "$WALLPAPER_DIR" -maxdepth 1 -type f \
         \( -iname "*.png" -o -iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.webp" \) \
     | sort
 )

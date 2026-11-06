@@ -9,11 +9,6 @@ import os
 import sys
 from pathlib import Path
 
-# Убедитесь, что библиотека установлена:
-# pip install markdown-pdf
-from markdown_pdf import MarkdownPdf, Section
-
-
 def main():
     parser = argparse.ArgumentParser(
         description="Конвертация Markdown-файла в PDF (формат вывода: то же имя, расширение .pdf)"
@@ -23,6 +18,17 @@ def main():
         help="Путь к входному Markdown-файлу (например, document.md)"
     )
     args = parser.parse_args()
+
+    # Use the shared environment even when launched without shell activation.
+    environment = Path.home() / ".usamg1t"
+    interpreter = environment / "bin/python"
+    if interpreter.is_file() and Path(sys.prefix).resolve() != environment.resolve():
+        os.execv(str(interpreter), [str(interpreter), str(Path(__file__).resolve()), *sys.argv[1:]])
+    try:
+        from markdown_pdf import MarkdownPdf, Section
+    except ModuleNotFoundError:
+        print("Не установлен markdown-pdf. Создайте окружение ~/.usamg1t через stow-all.", file=sys.stderr)
+        return 1
 
     input_path = Path(args.input_file).resolve()
 
@@ -63,4 +69,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

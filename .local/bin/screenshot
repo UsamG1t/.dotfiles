@@ -3,12 +3,24 @@
 # Depends: grim, slurp, wl-clipboard, wofi, libnotify (notify-send)
 # Install: cp screenshot ~/.local/bin/ && chmod +x ~/.local/bin/screenshot
 
-SAVE_DIR="$HOME/Pictures/Screenshots"
-TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
-TMPFILE="/tmp/screenshot_$TIMESTAMP.png"
-SAVEFILE="$SAVE_DIR/screenshot_$TIMESTAMP.png"
+set -uo pipefail
+umask 077
 
-mkdir -p "$SAVE_DIR"
+SAVE_DIR="$HOME/Pictures/Screenshots"
+
+fail() {
+    printf 'screenshot: %s\n' "$*" >&2
+    if command -v notify-send >/dev/null; then
+        notify-send "Screenshot" "$*" --urgency=critical || true
+    fi
+    exit 1
+}
+
+notify_result() {
+    if command -v notify-send >/dev/null; then
+        notify-send "Screenshot" "$1" --urgency=low || true
+    fi
+}
 
 # Геометрия активного окна снимается ДО открытия wofi —
 # пока фокус ещё не ушёл в меню
@@ -17,6 +29,8 @@ import sys, json
 d = json.load(sys.stdin)
 x, y = d['at']
 w, h = d['size']
+if not all(isinstance(v, int) for v in (x, y, w, h)) or w <= 0 or h <= 0:
+    raise ValueError('Invalid window geometry')
 print(f'{x},{y} {w}x{h}')
 " 2>/dev/null)
 
@@ -30,40 +44,65 @@ ACTION=$(printf "Copy\nSave\nBoth" | \
     wofi --dmenu --prompt "Action" --lines 3 --width 220 --height 135)
 [ -z "$ACTION" ] && exit 0
 
+case "$MODE" in Screen|Window|Area) ;; *) fail "Неизвестный тип снимка: $MODE" ;; esac
+case "$ACTION" in Copy|Save|Both) ;; *) fail "Неизвестное действие: $ACTION" ;; esac
+
+TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/screenshot.XXXXXXXX") || fail "Не удалось создать временный каталог"
+TMPFILE="$TMP_DIR/capture.png"
+cleanup() {
+    rm -f -- "$TMPFILE"
+    rmdir -- "$TMP_DIR" 2>/dev/null || true
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 # ── Захват ────────────────────────────────────────────────────────────────────
 case "$MODE" in
     Screen)
-        grim "$TMPFILE"
+        grim "$TMPFILE" || fail "Не удалось захватить экран"
         ;;
     Window)
         if [ -z "$ACTIVE_GEOM" ]; then
-            notify-send "Screenshot" "Не удалось определить активное окно" --urgency=low
-            exit 1
+            fail "Не удалось определить активное окно"
         fi
-        grim -g "$ACTIVE_GEOM" "$TMPFILE"
+        grim -g "$ACTIVE_GEOM" "$TMPFILE" || fail "Не удалось захватить окно"
         ;;
     Area)
+        command -v slurp >/dev/null || fail "Не установлен slurp"
         sleep 0.2   # подождать закрытия wofi перед slurp
-        GEOM=$(slurp)
+        GEOM=$(slurp) || exit 0
         [ -z "$GEOM" ] && exit 0
-        grim -g "$GEOM" "$TMPFILE"
+        grim -g "$GEOM" "$TMPFILE" || fail "Не удалось захватить область"
         ;;
 esac
+
+[[ -s "$TMPFILE" ]] || fail "Получено пустое изображение"
+
+save_image() {
+    mkdir -p -- "$SAVE_DIR" || fail "Не удалось создать $SAVE_DIR"
+    local timestamp
+    timestamp=$(date +"%Y-%m-%d_%H-%M-%S")
+    SAVEFILE=$(mktemp "$SAVE_DIR/screenshot_${timestamp}_XXXXXX.png") || fail "Не удалось создать файл снимка"
+    if ! mv -- "$TMPFILE" "$SAVEFILE"; then
+        rm -f -- "$SAVEFILE"
+        fail "Не удалось сохранить снимок"
+    fi
+}
 
 # ── Результат ─────────────────────────────────────────────────────────────────
 case "$ACTION" in
     Copy)
-        wl-copy --type image/png < "$TMPFILE"
-        rm "$TMPFILE"
-        notify-send "Screenshot" "Скопирован в буфер" --urgency=low
+        wl-copy --type image/png < "$TMPFILE" || fail "Не удалось скопировать снимок в буфер"
+        notify_result "Скопирован в буфер"
         ;;
     Save)
-        mv "$TMPFILE" "$SAVEFILE"
-        notify-send "Screenshot сохранён" "$(basename "$SAVEFILE")" --urgency=low
+        save_image
+        notify_result "Сохранён: $(basename -- "$SAVEFILE")"
         ;;
     Both)
-        wl-copy --type image/png < "$TMPFILE"
-        mv "$TMPFILE" "$SAVEFILE"
-        notify-send "Screenshot сохранён и скопирован" "$(basename "$SAVEFILE")" --urgency=low
+        save_image
+        wl-copy --type image/png < "$SAVEFILE" || fail "Снимок сохранён в $SAVEFILE, но скопировать его в буфер не удалось"
+        notify_result "Сохранён и скопирован: $(basename -- "$SAVEFILE")"
         ;;
 esac

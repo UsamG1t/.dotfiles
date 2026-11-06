@@ -16,6 +16,7 @@ fi
 fastfetch
 
 alias vim='nvim'
+alias usamg1t-run='source "$HOME/.usamg1t/bin/activate"'
 
 # Machine-specific settings stay outside the repository.
 if [[ -r "$HOME/.zshrc.local" ]]; then

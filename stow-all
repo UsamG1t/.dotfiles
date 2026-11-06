@@ -5,7 +5,7 @@ usage() {
     cat <<'EOF'
 Использование: ./stow-all [--dry-run]
 
-Разворачивает домашние настройки и два пакета SDDM.
+Разворачивает домашние настройки, два пакета SDDM и Python-окружение ~/.usamg1t.
   -n, --dry-run  Проверить все направления без изменений и без sudo.
   -h, --help     Показать справку.
 
@@ -34,6 +34,8 @@ command -v stow >/dev/null || die 'Не установлен пакет stow.'
 
 # Resolve the repository independently of the current working directory.
 repo_dir=$(dirname -- "$(realpath -e -- "${BASH_SOURCE[0]}")")
+command -v python3 >/dev/null || die 'Не установлен пакет python.'
+python3 "$repo_dir/setup/python-env.py" --dry-run
 home_target=$(realpath -e -- "$HOME")
 sddm_config=/etc/sddm.conf.d
 sddm_theme=/usr/share/sddm/themes/sddm-astronaut-theme
@@ -81,6 +83,7 @@ for source in "$repo_dir/sddm/config/theme.conf" "$repo_dir/sddm/theme/hyprland_
         die "Пользователь sddm не может прочитать $source. Настройте доступ к репозиторию (например, ACL)."
 done
 
+python3 "$repo_dir/setup/python-env.py"
 stow_home
 sudo -- stow "${common[@]}" --dir="$repo_dir/sddm" --target="$sddm_config" config
 sudo -- stow "${common[@]}" --dir="$repo_dir/sddm" --target="$sddm_theme/Themes" theme

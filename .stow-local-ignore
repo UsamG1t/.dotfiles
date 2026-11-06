@@ -2,11 +2,14 @@
 ^sddm$
 ^stow-all$
 ^packages\.md$
+^python-packages\.toml$
+^TODO\.md$
 ^\.git$
 ^\.agents$
 ^\.aws$
 ^\.codex$
 ^\.zshrc\.local$
+^\.usamg1t$
 ^\.gitignore$
 ^CLAUDE\.md$
 ^README\.md$

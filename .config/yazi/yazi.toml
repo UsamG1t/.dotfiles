@@ -1,6 +1,6 @@
 # ~/.config/yazi/yazi.toml
 
-[manager]
+[mgr]
 ratio          = [1, 3, 4]
 sort_by        = "natural"
 sort_dir_first = true
@@ -17,23 +17,23 @@ max_height = 900
 
 [opener]
 image = [
-  { run = 'imv "$@"',      desc = "imv"     },
+  { run = 'imv %s',      orphan = true, desc = "imv"     },
 ]
 video = [
-  { run = 'mpv "$@"',      desc = "mpv"     },
+  { run = 'mpv %s',      orphan = true, desc = "mpv"     },
 ]
 audio = [
-  { run = 'mpv "$@"',      desc = "mpv"     },
+  { run = 'mpv %s',      orphan = true, desc = "mpv"     },
 ]
 pdf = [
-  { run = 'zathura "$@"',  desc = "zathura" },
+  { run = 'zathura %s',  orphan = true, desc = "zathura" },
 ]
 text = [
-  { run = 'code-oss "$@"', desc = "VS Code" },
-  { run = 'subl "$@"',     desc = "Sublime" },
+  { run = 'code-oss %s', orphan = true, desc = "VS Code" },
+  { run = 'subl %s',     orphan = true, desc = "Sublime" },
 ]
 fallback = [
-  { run = 'xdg-open "$@"', desc = "Open"   },
+  { run = 'xdg-open %s1', orphan = true, desc = "Open"   },
 ]
 
 [open]

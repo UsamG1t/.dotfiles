@@ -5,14 +5,15 @@
 #
 # Install: cp thunderbird-here ~/.local/bin/ && chmod +x ~/.local/bin/thunderbird-here
 
-TARGET_WS=$(hyprctl activeworkspace -j | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
-
-if hyprctl clients -j 2>/dev/null | python3 -c "
-import sys, json
-clients = json.load(sys.stdin)
-exit(0 if any(c.get('class','').lower() == 'thunderbird' for c in clients) else 1)
-"; then
-    hyprctl dispatch movetoworkspace "$TARGET_WS,class:thunderbird"
-else
-    thunderbird &
-fi
+exec hyprctl eval '
+local workspace = hl.get_active_workspace()
+if not workspace then return end
+for _, window in ipairs(hl.get_windows()) do
+    if window.class:lower() == "thunderbird" then
+        hl.dispatch(hl.dsp.window.move({ window = window, workspace = workspace, follow = true }))
+        hl.dispatch(hl.dsp.focus({ window = window }))
+        return
+    end
+end
+hl.exec_cmd("thunderbird")
+'

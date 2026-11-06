@@ -20,7 +20,6 @@ hl.bind(mainMod .. " + CTRL + I",       hl.dsp.exec_cmd("toggle-btop"))        -
 
 -- Other workspace
 hl.bind(mainMod .. " + O",         hl.dsp.focus({ workspace = workspaces.other }))   -- Focus other workspace
-hl.bind(mainMod .. " + SHIFT + O", hl.dsp.exec_cmd("send-home-or-other"))            -- Toggle: Other ↔ home workspace
 
 -- Vim-like focus
 hl.bind(mainMod .. " + H", hl.dsp.focus({ direction = "left" }))   -- Focus left
@@ -48,7 +47,7 @@ end
 hl.bind(mainMod .. " + C", hl.dsp.window.close())                      -- Close window
 hl.bind(mainMod .. " + V", hl.dsp.window.float({ action = "toggle" })) -- Toggle floating
 hl.bind(mainMod .. " + P", hl.dsp.window.pseudo())                     -- Toggle pseudo-tile
-hl.bind(mainMod .. " + N", hl.dsp.exec_cmd("hyprctl dispatch pin"))    -- Toggle window pin (all workspaces)
+hl.bind(mainMod .. " + N", hl.dsp.window.pin())                      -- Toggle window pin (all workspaces)
 hl.bind(mainMod .. " + D", hl.dsp.workspace.toggle_special("desktop")) -- Show/hide desktop
 hl.bind(mainMod .. " + Num_Lock", hl.dsp.exec_cmd("lock-screen"))      -- Lock screen
 hl.bind(mainMod .. " + M", hl.dsp.exit())                              -- Exit Hyprland

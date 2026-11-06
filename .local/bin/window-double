@@ -2,13 +2,13 @@
 # window-double — удваивает размер активного плавающего окна
 # Install: cp window-double ~/.local/bin/ && chmod +x ~/.local/bin/window-double
 
-read -r W H < <(
-    hyprctl activewindow -j | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-print(d['size'][0], d['size'][1])
-"
-)
-
-# resizeactive работает через дельту: чтобы удвоить, добавляем текущий размер
-hyprctl dispatch resizeactive "$W $H"
+exec hyprctl eval '
+local window = hl.get_active_window()
+if not window or not window.floating then return end
+hl.dispatch(hl.dsp.window.resize({
+    window = window,
+    x = window.size.x * 2,
+    y = window.size.y * 2,
+    relative = false,
+}))
+'

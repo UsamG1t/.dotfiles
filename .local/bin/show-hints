@@ -15,7 +15,7 @@ GEN_PY="$MODULES/keybinds_gen.py"
 
 # ── Toggle: close if the overlay is already open ──────────────────────────────
 if hyprctl clients -j 2>/dev/null | grep -qE '"class"\s*:\s*"keyhint"'; then
-    hyprctl dispatch closewindow class:keyhint
+    hyprctl dispatch "hl.dsp.window.close({window = 'class:keyhint'})"
     exit 0
 fi
 

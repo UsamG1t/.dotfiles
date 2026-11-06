@@ -3,14 +3,14 @@
 # Если окно в скрэтчпаде → вернуть на текущий воркспейс
 # Если нет → отправить в скрэтчпад
 
-WS=$(hyprctl activewindow -j 2>/dev/null | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-print(d['workspace']['name'])
-" 2>/dev/null)
+exec hyprctl eval '
+local window = hl.get_active_window()
+local workspace = hl.get_active_workspace()
+if not window or not workspace then return end
 
-if [ "$WS" = "special:magic" ]; then
-    hyprctl dispatch movetoworkspace current
+if window.workspace and window.workspace.config_name == "special:magic" then
+    hl.dispatch(hl.dsp.window.move({ window = window, workspace = workspace, follow = true }))
 else
-    hyprctl dispatch movetoworkspace special:magic
-fi
+    hl.dispatch(hl.dsp.window.move({ window = window, workspace = "special:magic", follow = false }))
+end
+'

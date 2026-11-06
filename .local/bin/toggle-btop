@@ -8,7 +8,7 @@
 CLASS="kitty-btop"
 
 if hyprctl clients -j 2>/dev/null | grep -qE '"class"\s*:\s*"'"$CLASS"'"'; then
-    hyprctl dispatch closewindow "class:$CLASS"
+    hyprctl dispatch "hl.dsp.window.close({window = 'class:$CLASS'})"
 else
     kitty \
         --class "$CLASS" \

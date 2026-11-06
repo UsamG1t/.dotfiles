@@ -2,13 +2,14 @@
 # window-half — уменьшает размер активного плавающего окна вдвое
 # Install: cp window-half ~/.local/bin/ && chmod +x ~/.local/bin/window-half
 
-read -r W H < <(
-    hyprctl activewindow -j | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-print(d['size'][0], d['size'][1])
-"
-)
-
-# Отрицательная дельта = убрать половину каждого измерения
-hyprctl dispatch resizeactive "$(( -(W / 2) )) $(( -(H / 2) ))"
+# Read and resize the same window within one compositor request.
+exec hyprctl eval '
+local window = hl.get_active_window()
+if not window or not window.floating then return end
+hl.dispatch(hl.dsp.window.resize({
+    window = window,
+    x = math.max(1, math.floor(window.size.x / 2)),
+    y = math.max(1, math.floor(window.size.y / 2)),
+    relative = false,
+}))
+'

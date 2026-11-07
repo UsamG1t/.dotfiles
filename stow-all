@@ -1,89 +1,109 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/usr/bin/env python3
 
-usage() {
-    cat <<'EOF'
-Использование: ./stow-all [--dry-run]
+import argparse
+import configparser
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
 
-Разворачивает домашние настройки, два пакета SDDM и Python-окружение ~/.usamg1t.
-  -n, --dry-run  Проверить все направления без изменений и без sudo.
-  -h, --help     Показать справку.
 
-Запускайте от обычного пользователя; для системных ссылок вызывается sudo.
-Конфликтующие файлы нужно заранее сохранить и убрать с целевых путей.
-Тема SDDM, её фон и доступ пользователя sddm к репозиторию должны быть готовы.
-EOF
-}
+REPO_DIR = Path(__file__).resolve().parent
+HOME_DIR = Path.home().resolve()
+SDDM_CONFIG_DIR = Path("/etc/sddm.conf.d")
+SDDM_THEME_DIR = Path("/usr/share/sddm/themes/sddm-astronaut-theme")
+PYTHON_SETUP = REPO_DIR / "setup/python-env.py"
 
-die() {
-    printf 'stow-all: %s\n' "$*" >&2
-    exit 1
-}
+HYPRLAND_SCRIPTS = (
+    "calendar-popup", "firefox-here", "lock-screen", "notifications-status",
+    "screenshot", "send-home-or-other", "show-hints", "sublime-here",
+    "thunderbird-here", "toggle-bluetooth", "toggle-btop", "toggle-scratchpad",
+    "wallpaper-daemon", "window-double", "window-half",
+)
+HYPRLAND_IGNORES = (
+    r"(^|/)\.config/(hypr|hyprland|waybar)$",
+    r"(^|/)\.local/bin/(" + "|".join(HYPRLAND_SCRIPTS) + r")$",
+)
 
-dry_run=0
-for arg in "$@"; do
-    case "$arg" in
-        -n|--dry-run) dry_run=1 ;;
-        -h|--help) usage; exit 0 ;;
-        *) usage >&2; die "Неизвестный аргумент: $arg" ;;
-    esac
-done
 
-(( EUID != 0 )) || die 'Запустите скрипт без sudo, от владельца домашних настроек.'
-command -v stow >/dev/null || die 'Не установлен пакет stow.'
+def stow_dir(source, target, package=".", *, dry_run=False, use_sudo=False, ignore=()):
+    """Развернуть один пакет; при пробном запуске не менять файлы и не вызывать sudo."""
+    command = [
+        "stow", "--restow", "--no-folding", "--verbose=1",
+        f"--dir={source}", f"--target={target}",
+    ]
+    command.extend(f"--ignore={pattern}" for pattern in ignore)
+    if dry_run:
+        command.append("--simulate")
+    elif use_sudo:
+        command = ["sudo", "--", *command]
+    command.append(package)
+    return subprocess.run(command, check=not dry_run).returncode == 0
 
-# Resolve the repository independently of the current working directory.
-repo_dir=$(dirname -- "$(realpath -e -- "${BASH_SOURCE[0]}")")
-command -v python3 >/dev/null || die 'Не установлен пакет python.'
-python3 "$repo_dir/setup/python-env.py" --dry-run
-home_target=$(realpath -e -- "$HOME")
-sddm_config=/etc/sddm.conf.d
-sddm_theme=/usr/share/sddm/themes/sddm-astronaut-theme
-common=(--restow --no-folding --verbose=1)
 
-[[ "$repo_dir" != "$home_target" ]] || die 'Репозиторий должен находиться в отдельном каталоге.'
-[[ -d "$sddm_config" ]] || die "Не найден каталог $sddm_config."
-[[ -d "$sddm_theme/Themes" ]] || die 'Установите sddm-astronaut-theme.'
-[[ -f "$sddm_theme/Backgrounds/Fantasy-Medieval_Travern.png" ]] ||
-    die "Не найден фон $sddm_theme/Backgrounds/Fantasy-Medieval_Travern.png."
-grep -Eq '^[[:space:]]*ConfigFile[[:space:]]*=[[:space:]]*Themes/hyprland_custom\.conf[[:space:]]*$' \
-    "$sddm_theme/metadata.desktop" ||
-    die "Укажите ConfigFile=Themes/hyprland_custom.conf в $sddm_theme/metadata.desktop."
+def main():
+    parser = argparse.ArgumentParser(
+        description="Развернуть настройки через Stow и подготовить Python-окружение ~/.usamg1t.",
+        epilog="Запускайте без sudo. Конфликтующие файлы нужно заранее сохранить и убрать с целевых путей.",
+    )
+    parser.add_argument("-n", "--dry-run", action="store_true", help="Проверить без изменений, установки пакетов и sudo")
+    parser.add_argument("--no-hyprland", action="store_true", help="Пропустить Hyprland, Waybar, SDDM и связанные скрипты")
+    args = parser.parse_args()
 
-stow_home() {
-    stow "${common[@]}" --dir="$repo_dir" --target="$home_target" "$@" .
-}
+    if os.geteuid() == 0:
+        raise ValueError("Запустите скрипт без sudo, от владельца домашних настроек.")
+    if not shutil.which("stow"):
+        raise ValueError("Не установлен пакет stow.")
+    if REPO_DIR == HOME_DIR:
+        raise ValueError("Репозиторий должен находиться в отдельном каталоге.")
+    subprocess.run([sys.executable, str(PYTHON_SETUP), "--dry-run"], check=True)
 
-stow_sddm_config() {
-    stow "${common[@]}" --dir="$repo_dir/sddm" --target="$sddm_config" "$@" config
-}
+    ignore = HYPRLAND_IGNORES if args.no_hyprland else ()
+    targets = [(REPO_DIR, HOME_DIR, ".", False)]
+    if not args.no_hyprland:
+        for directory in (SDDM_CONFIG_DIR, SDDM_THEME_DIR / "Themes"):
+            if not directory.is_dir():
+                raise ValueError(f"Не найден {directory}. Установите SDDM и sddm-astronaut-theme.")
+        background = SDDM_THEME_DIR / "Backgrounds/Fantasy-Medieval_Travern.png"
+        if not background.is_file():
+            raise ValueError(f"Не найден фон {background}.")
+        metadata = configparser.ConfigParser(interpolation=None)
+        metadata.read(SDDM_THEME_DIR / "metadata.desktop")
+        if metadata.get("SddmGreeterTheme", "ConfigFile", fallback="") != "Themes/hyprland_custom.conf":
+            raise ValueError(f"Укажите ConfigFile=Themes/hyprland_custom.conf в {SDDM_THEME_DIR / 'metadata.desktop'}.")
+        targets.extend([
+            (REPO_DIR / "sddm", SDDM_CONFIG_DIR, "config", True),
+            (REPO_DIR / "sddm", SDDM_THEME_DIR / "Themes", "theme", True),
+        ])
 
-stow_sddm_theme() {
-    stow "${common[@]}" --dir="$repo_dir/sddm" --target="$sddm_theme/Themes" "$@" theme
-}
+    # Проверяем все направления до установки пакетов и создания ссылок.
+    checks = [
+        stow_dir(source, target, package, dry_run=True, ignore=ignore)
+        for source, target, package, _ in targets
+    ]
+    if not all(checks):
+        raise ValueError("Предварительная проверка Stow не прошла; изменения не применены.")
+    if args.dry_run:
+        print("Проверка завершена; файлы, пакеты и права доступа не изменены.")
+        return
 
-# Check every target before changing any of them. Never adopt installed files
-# into the repository: --adopt could overwrite the reviewed configurations.
-failed=0
-stow_home --simulate || failed=1
-stow_sddm_config --simulate || failed=1
-stow_sddm_theme --simulate || failed=1
-(( failed == 0 )) || die 'Предварительная проверка Stow не прошла; изменения не применены.'
+    if not args.no_hyprland:
+        if not shutil.which("sudo"):
+            raise ValueError("Не установлен пакет sudo.")
+        subprocess.run(["sudo", "-v"], check=True)
+        for source in (REPO_DIR / "sddm/config/theme.conf", REPO_DIR / "sddm/theme/hyprland_custom.conf"):
+            if subprocess.run(["sudo", "-u", "sddm", "--", "test", "-r", str(source)]).returncode:
+                raise ValueError(f"Пользователь sddm не может прочитать {source}. Настройте доступ к репозиторию (например, ACL).")
 
-if (( dry_run )); then
-    printf 'Проверка Stow завершена; файлы и права доступа не изменены.\n'
-    exit 0
-fi
+    subprocess.run([sys.executable, str(PYTHON_SETUP)], check=True)
+    for source, target, package, use_sudo in targets:
+        stow_dir(source, target, package, use_sudo=use_sudo, ignore=ignore)
 
-# Obtain credentials and verify greeter access before applying the home package.
-command -v sudo >/dev/null || die 'Не установлен пакет sudo.'
-sudo -v
-for source in "$repo_dir/sddm/config/theme.conf" "$repo_dir/sddm/theme/hyprland_custom.conf"; do
-    sudo -u sddm -- test -r "$source" ||
-        die "Пользователь sddm не может прочитать $source. Настройте доступ к репозиторию (например, ACL)."
-done
 
-python3 "$repo_dir/setup/python-env.py"
-stow_home
-sudo -- stow "${common[@]}" --dir="$repo_dir/sddm" --target="$sddm_config" config
-sudo -- stow "${common[@]}" --dir="$repo_dir/sddm" --target="$sddm_theme/Themes" theme
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, configparser.Error, subprocess.CalledProcessError) as error:
+        print(f"stow-all: {error}", file=sys.stderr)
+        sys.exit(1)

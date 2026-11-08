@@ -13,3 +13,5 @@
 ^\.gitignore$
 ^CLAUDE\.md$
 ^README\.md$
+^__pycache__$
+\.py[cod]$

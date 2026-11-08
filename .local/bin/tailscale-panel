@@ -1,0 +1,542 @@
+#!/usr/bin/env python3
+"""Индикатор Waybar и небольшая панель Tailscale без сторонних Python-пакетов."""
+
+import argparse
+from concurrent.futures import ThreadPoolExecutor
+import curses
+from html import escape
+import ipaddress
+import json
+import locale
+import os
+from pathlib import Path
+from queue import Empty, Queue
+import shutil
+import subprocess
+import sys
+import time
+import unicodedata
+from urllib.parse import urlsplit
+
+
+WINDOW_CLASS = "tailscale-popup"
+WORKSPACE = "special:tailscale"
+REFRESH_SECONDS = 3
+
+
+def clean(text):
+    """Имена устройств и вывод команд не должны содержать управляющие символы."""
+    return " ".join("".join(c if c.isprintable() else " " for c in str(text)).split())
+
+
+def run(command, *, timeout=8):
+    return subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+
+
+def read_status():
+    try:
+        result = run(["tailscale", "status", "--json"])
+        try:
+            status = json.loads(result.stdout)
+        except ValueError:
+            status = None
+        if isinstance(status, dict) and status.get("BackendState"):
+            return status
+        error = clean(result.stderr or result.stdout or "Пустой ответ tailscale")
+        # Ошибку прав доступа нельзя выдавать за остановленную службу.
+        unavailable = any(s in error.lower() for s in ("connection refused", "no such file", "doesn't appear to be running"))
+        return {"BackendState": "Unavailable" if unavailable else "Error", "_error": error}
+    except FileNotFoundError:
+        return {"BackendState": "Missing", "_error": "Не установлен пакет tailscale"}
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return {"BackendState": "Error", "_error": clean(error)}
+
+
+def node_name(node):
+    return clean(node.get("HostName") or node.get("DNSName", "").rstrip(".") or "Без имени")
+
+
+def node_ip(node):
+    addresses = node.get("TailscaleIPs") or []
+    for address in sorted(addresses, key=lambda value: ":" in value):
+        try:
+            return str(ipaddress.ip_interface(address).ip)
+        except ValueError:
+            continue
+    return ""
+
+
+def peers(status):
+    return sorted((status.get("Peer") or {}).values(), key=lambda p: (
+        not p.get("ExitNode", False), not p.get("Online", False), node_name(p).casefold(), node_ip(p),
+    ))
+
+
+def connection(status):
+    """CSS-класс, значок и человекочитаемое состояние."""
+    state = status.get("BackendState")
+    if state in ("Stopped", "Unavailable", "Missing"):
+        label = {"Stopped": "Выключен", "Unavailable": "Служба остановлена", "Missing": "Не установлен"}[state]
+        return "off", "󰌙", label
+    if state in ("NeedsLogin", "NeedsMachineAuth"):
+        return "warning", "󰌙", "Требуется вход" if state == "NeedsLogin" else "Требуется одобрение устройства"
+    if state in ("NoState", "Starting"):
+        return "connecting", "󰔟", "Подключение…"
+    if state != "Running":
+        return "error", "󰅚", "Ошибка подключения"
+    if not (status.get("Self") or {}).get("Online", False):
+        return "warning", "󰌘", "Нет связи с сервером управления"
+    exit_node = status.get("ExitNodeStatus")
+    selected = next((p for p in peers(status) if p.get("ExitNode")), None)
+    if exit_node or selected:
+        if not (exit_node if exit_node is not None else selected).get("Online", False):
+            return "error", "󰖟", "Exit-node недоступен"
+        return "exit", "󰖟", "Подключён через exit-node"
+    return "connected", "󰌘", "Подключён к сети Tailscale"
+
+
+def exit_name(status):
+    selected = next((p for p in peers(status) if p.get("ExitNode")), None)
+    if selected:
+        return node_name(selected)
+    exit_node = status.get("ExitNodeStatus") or {}
+    return node_ip(exit_node) or clean(exit_node.get("ID", "")) or "не выбран"
+
+
+def waybar_status(status):
+    css, icon, label = connection(status)
+    own = status.get("Self") or {}
+    lines = [f"Tailscale: {label}", f"Устройство: {node_name(own)}", f"IP: {node_ip(own) or '—'}"]
+    if status.get("ExitNodeStatus") or any(p.get("ExitNode") for p in peers(status)):
+        lines.append(f"Exit-node: {exit_name(status)}")
+    lines.extend(clean(line) for line in (status.get("Health") or []))
+    if status.get("_error"):
+        lines.append(status["_error"])
+    if status.get("Health") and css in ("connected", "exit"):
+        css = [css, "warning"]
+    lines.append("Нажмите, чтобы открыть панель")
+    return {"text": icon, "class": css, "tooltip": escape("\n".join(lines))}
+
+
+def ping_node(address):
+    # Только числовой IP из status, никаких shell-команд или непроверенных имён.
+    address = str(ipaddress.ip_address(address))
+    try:
+        result = run(["tailscale", "ping", "--c=1", "--timeout=2s", "--until-direct=false", address], timeout=4)
+        output = clean(result.stdout or result.stderr)
+        if result.returncode == 0:
+            # Сохраняем и задержку, и путь: direct / DERP. Это Tailscale ping, не ICMP.
+            detail = output.partition(" via ")[2] or output
+            route, separator, latency = detail.rpartition(" in ")
+            if separator:
+                detail = f"{latency} · {route}"
+            return True, detail
+        return False, output or "Нет ответа"
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return False, clean(error)
+
+
+def control(arguments):
+    """Сначала обычные права; при необходимости — графическое подтверждение Polkit."""
+    binary = shutil.which("tailscale")
+    if not binary:
+        raise RuntimeError("Не установлен tailscale")
+    command = [binary, *arguments]
+    result = run(command, timeout=30)
+    message = clean(result.stderr or result.stdout)
+    if result.returncode and any(s in message.lower() for s in ("access denied", "permission denied", "must be root")):
+        if not shutil.which("pkexec"):
+            raise RuntimeError("Недостаточно прав; для графического запроса нужен polkit (pkexec)")
+        result = run(["pkexec", *command], timeout=120)
+        message = clean(result.stderr or result.stdout)
+    if result.returncode:
+        raise RuntimeError(message or "Команда не выполнена")
+    return "Готово"
+
+
+def connect(status):
+    if status.get("BackendState") == "Unavailable":
+        result = run(["pkexec", "systemctl", "start", "tailscaled.service"], timeout=120)
+        if result.returncode:
+            raise RuntimeError(clean(result.stderr) or "Не удалось запустить tailscaled")
+    # Без флагов up сохраняет существующие настройки DNS, маршрутов и exit-node.
+    return control(["up"])
+
+
+def geometry(monitor):
+    width, height = monitor["width"], monitor["height"]
+    if monitor.get("transform", 0) % 2:
+        width, height = height, width
+    width, height = int(width / monitor.get("scale", 1)), int(height / monitor.get("scale", 1))
+    left, top, right, bottom = monitor.get("reserved", [0, 0, 0, 0])
+    panel_width, panel_height = (width - left - right) // 2, (height - top - bottom) // 2
+    return panel_width, panel_height, monitor["x"] + width - right - panel_width - 12, monitor["y"] + top + 12
+
+
+def hypr(*arguments):
+    result = run(["hyprctl", *arguments])
+    if result.returncode or result.stdout.strip().lower().startswith("error"):
+        raise RuntimeError(clean(result.stderr or result.stdout))
+    return result.stdout
+
+
+def toggle_panel():
+    # Блокировка не даёт двойному клику запустить два терминала.
+    import fcntl
+    runtime = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+    fd = os.open(runtime / "tailscale-panel.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        monitors = json.loads(hypr("-j", "monitors"))
+        monitor = next(m for m in monitors if m.get("focused"))
+        if monitor.get("specialWorkspace", {}).get("name") == WORKSPACE:
+            hypr("dispatch", 'hl.dsp.workspace.toggle_special("tailscale")')
+            return
+        clients = json.loads(hypr("-j", "clients"))
+        client = next((c for c in clients if c.get("class") == WINDOW_CLASS), None)
+        if not client:
+            subprocess.Popen([
+                "kitty", "--class", WINDOW_CLASS, "--title", "Tailscale",
+                "-o", "font_family=Hack Nerd Font Mono", "-o", "font_size=10", "-o", "window_padding_width=8",
+                "-o", "remember_window_size=no", "-o", "background_opacity=0.96",
+                "-o", "background=#141414", "-o", "foreground=#e0e0e0",
+                "-o", "color1=#ef6b73", "-o", "color2=#70c987", "-o", "color3=#d4a020",
+                "-o", "color4=#322a3b", "-o", "color5=#b77aef", "-o", "color8=#888888",
+                sys.executable, str(Path(__file__).resolve()), "--tui", "--scratchpad",
+            ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                clients = json.loads(hypr("-j", "clients"))
+                client = next((c for c in clients if c.get("class") == WINDOW_CLASS), None)
+                if client:
+                    break
+                time.sleep(0.05)
+            if not client:
+                raise RuntimeError("Kitty не открыл панель Tailscale")
+        w, h, x, y = geometry(monitor)
+        # Координаты абсолютные; учитываем масштаб, поворот, Waybar и внешние мониторы.
+        selector = json.dumps("address:" + client["address"])
+        monitor_name = json.dumps(monitor["name"])
+        hypr("eval", f'''
+            hl.dispatch(hl.dsp.workspace.move({{workspace="special:tailscale", monitor={monitor_name}}}))
+            hl.dispatch(hl.dsp.workspace.toggle_special("tailscale"))
+            hl.dispatch(hl.dsp.window.resize({{window={selector}, x={w}, y={h}, relative=false}}))
+            hl.dispatch(hl.dsp.window.move({{window={selector}, x={x}, y={y}, relative=false}}))
+            hl.dispatch(hl.dsp.window.alter_zorder({{window={selector}, mode="top"}}))
+            hl.dispatch(hl.dsp.focus({{window={selector}}}))
+        ''')
+
+
+def fit(text, width):
+    """Обрезка/дополнение по ячейкам терминала, включая кириллицу и emoji."""
+    result, used = "", 0
+    for char in str(text):
+        if not char.isprintable() and unicodedata.category(char) != "Co":
+            char = " "
+        size = 0 if unicodedata.combining(char) or char == "\ufe0f" else 2 if unicodedata.east_asian_width(char) in "WF" else 1
+        if used + size > width:
+            break
+        result += char
+        used += size
+    return result + " " * max(0, width - used)
+
+
+class Panel:
+    def __init__(self, screen, *, scratchpad=False):
+        self.screen = screen
+        self.scratchpad = scratchpad
+        self.pool = ThreadPoolExecutor(max_workers=8)
+        self.events = Queue()
+        self.status = {"BackendState": "Starting"}
+        self.selected = 0
+        self.selected_ip = ""
+        self.results = {}
+        self.pending = set()
+        self.refreshing = False
+        self.next_refresh = 0
+        self.busy = False
+        self.message = "↑↓ выбрать · Enter/p ping · a ping all · e exit-node · c подключение"
+        self.choosing = False
+        self.exit_selected = 0
+        self.options = []
+        self.buttons = []
+
+    def submit(self, kind, key, function, *arguments):
+        def work():
+            try:
+                value = function(*arguments)
+            except Exception as error:
+                value = error
+            self.events.put((kind, key, value))
+        self.pool.submit(work)
+
+    def receive(self):
+        while True:
+            try:
+                kind, key, value = self.events.get_nowait()
+            except Empty:
+                break
+            if kind == "status":
+                self.refreshing = False
+                if isinstance(value, Exception):
+                    self.message = clean(value)
+                else:
+                    self.status = value
+                    nodes = peers(value)
+                    self.selected = next((i for i, p in enumerate(nodes) if node_ip(p) == self.selected_ip), min(self.selected, max(0, len(nodes) - 1)))
+            elif kind == "ping":
+                self.pending.discard(key)
+                self.results[key] = (False, clean(value)) if isinstance(value, Exception) else value
+            else:
+                self.busy = False
+                self.message = clean(value)
+                self.next_refresh = 0
+
+    def ping(self, nodes):
+        if self.status.get("BackendState") != "Running":
+            self.message = "Сначала подключитесь к Tailscale"
+            return
+        for node in nodes:
+            address = node_ip(node)
+            if address and address not in self.pending:
+                self.pending.add(address)
+                self.submit("ping", address, ping_node, address)
+
+    def action(self, function, *arguments):
+        if not self.busy:
+            self.busy = True
+            self.message = "Выполняется… При необходимости появится запрос прав администратора"
+            self.submit("action", None, function, *arguments)
+
+    def put(self, y, x, text, color=0, width=None):
+        height, columns = self.screen.getmaxyx()
+        if not (0 <= y < height and 0 <= x < columns - 1):
+            return
+        try:
+            self.screen.addstr(y, x, fit(text, min(width if width is not None else columns - x - 1, columns - x - 1)), color)
+        except curses.error:
+            pass  # Изменение размеров терминала во время перерисовки.
+
+    def button(self, y, x, label, key):
+        self.put(y, x, label, curses.color_pair(4), len(label))
+        self.buttons.append((y, x, x + len(label), key))
+
+    def exit_options(self):
+        return [{"HostName": "Без exit-node — только сеть Tailscale", "TailscaleIPs": []}, *[
+            p for p in peers(self.status) if p.get("ExitNodeOption") and p.get("Online") and not p.get("Expired")
+        ]]
+
+    def draw(self):
+        self.screen.erase()
+        height, width = self.screen.getmaxyx()
+        self.buttons = []
+        css, _, label = connection(self.status)
+        color = curses.color_pair({"connected": 1, "exit": 4, "off": 5, "error": 2}.get(css, 3))
+        self.put(0, 1, "󰌘 TAILSCALE   " + label, color | curses.A_BOLD)
+        own = self.status.get("Self") or {}
+        self.put(1, 1, f"Это устройство: {node_name(own)}  ·  {node_ip(own) or '—'}")
+        self.put(2, 1, f"Exit-node: {exit_name(self.status)}", curses.color_pair(4))
+        if self.status.get("AuthURL"):
+            self.button(3, 1, "[L Login in browser]", "l")
+        self.button(4, 1, "[A Ping all]", "a")
+        self.button(4, 15, "[R Refresh]", "r")
+        self.button(4, 29, "[E Exit node]", "e")
+        label = "[C Disconnect]" if self.status.get("BackendState") == "Running" else "[C Connect]"
+        self.button(4, 45, label, "c")
+        self.button(4, 63, "[Q Hide]" if self.scratchpad else "[Q Close]", "q")
+        if height < 12 or width < 60:
+            self.put(6, 1, "Увеличьте окно: нужно хотя бы 60×12 ячеек", curses.color_pair(3))
+            self.screen.refresh()
+            return
+        self.row_count = max(1, height - 12)
+        if self.choosing:
+            self.put(6, 1, "EXIT-NODE · ↑↓ / клик выбрать · Enter применить · Esc назад", curses.color_pair(4))
+            options = self.options
+            self.exit_selected = min(self.exit_selected, len(options) - 1)
+            self.offset = max(0, self.exit_selected - self.row_count + 1)
+            for row, node in enumerate(options[self.offset:self.offset + self.row_count], 7):
+                index = self.offset + row - 7
+                mark = "󰖟" if index else "󰌘"
+                attr = curses.color_pair(6) | curses.A_BOLD if index == self.exit_selected else 0
+                self.put(row, 1, f"{mark} {node_name(node)}  {node_ip(node)}", attr)
+        else:
+            nodes = peers(self.status)
+            name_width = min(28, max(12, width - 56))
+            self.put(6, 1, fit("   Устройство", name_width + 3) + fit("IP", 17) + "Связь / последний ping", curses.A_BOLD)
+            self.offset = max(0, self.selected - self.row_count + 1)
+            for row, node in enumerate(nodes[self.offset:self.offset + self.row_count], 7):
+                index = self.offset + row - 7
+                address = node_ip(node)
+                online = node.get("Online") and not node.get("Expired")
+                mark = "●" if online else "○"
+                detail = "online" if online else "offline"
+                attr = curses.color_pair(1 if online else 5)
+                if node.get("Expired"):
+                    detail = "ключ истёк"
+                if address in self.pending:
+                    detail, attr = "… ping…", curses.color_pair(3)
+                elif address in self.results:
+                    ok, output = self.results[address]
+                    detail, attr = ("✓ " if ok else "✗ ") + output, curses.color_pair(1 if ok else 2)
+                if node.get("ExitNode"):
+                    detail = "󰖟 " + detail
+                elif node.get("ExitNodeOption"):
+                    detail = "exit · " + detail
+                if index == self.selected:
+                    attr = curses.color_pair(6) | curses.A_BOLD
+                self.put(row, 1, mark + "  " + fit(node_name(node), name_width) + fit(address or "—", 17) + detail, attr)
+                self.button(row, width - 8, "[ping]", f"ping:{index}")
+            if not nodes:
+                self.put(7, 1, "Нет устройств для отображения", curses.color_pair(5))
+            if nodes and self.selected < len(nodes):
+                self.selected_ip = node_ip(nodes[self.selected])
+                self.put(height - 4, 1, f"Выбрано: {node_name(nodes[self.selected])} · {node_ip(nodes[self.selected])}")
+        health = self.status.get("Health") or []
+        self.put(height - 3, 1, self.status.get("_error") or (clean(health[0]) if health else "Онлайн — статус сервера управления; ping — проверка пути Tailscale, не ICMP"), curses.color_pair(3))
+        self.put(height - 2, 1, self.message, curses.color_pair(3) if self.busy else 0)
+        self.put(height - 1, 1, "↑↓/jk выбор · Enter/p ping · y копировать IP · e exit · r обновить · Esc/q " + ("скрыть" if self.scratchpad else "закрыть"), curses.color_pair(5))
+        self.screen.refresh()
+
+    def handle(self, key):
+        nodes = peers(self.status)
+        if key == curses.KEY_MOUSE:
+            try:
+                _, x, y, _, state = curses.getmouse()
+            except curses.error:
+                return True
+            if state & curses.BUTTON4_PRESSED:
+                key = curses.KEY_UP
+            elif state & getattr(curses, "BUTTON5_PRESSED", 0):
+                key = curses.KEY_DOWN
+            elif state & (curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED | curses.BUTTON1_DOUBLE_CLICKED):
+                button = next((b for b in self.buttons if b[0] == y and b[1] <= x < b[2]), None)
+                if button:
+                    if button[3].startswith("ping:"):
+                        index = int(button[3].split(":")[1])
+                        self.selected = index
+                        self.ping(nodes[index:index + 1])
+                        return True
+                    key = ord(button[3])
+                elif 7 <= y < 7 + getattr(self, "row_count", 0):
+                    index = self.offset + y - 7
+                    if self.choosing:
+                        self.exit_selected = min(index, len(self.options) - 1)
+                    elif nodes:
+                        self.selected = min(index, len(nodes) - 1)
+                    return True
+                else:
+                    return True
+            else:
+                return True
+        if key in (ord("q"), 27):
+            if self.choosing:
+                self.choosing = False
+                return True
+            if self.scratchpad:
+                # Скрываем окно, сохраняя результаты ping и текущую операцию.
+                hypr("dispatch", 'hl.dsp.workspace.toggle_special("tailscale")')
+                return True
+            return False
+        if self.choosing:
+            count = len(self.options)
+            if key in (curses.KEY_DOWN, ord("j")):
+                self.exit_selected = min(self.exit_selected + 1, count - 1)
+            elif key in (curses.KEY_UP, ord("k")):
+                self.exit_selected = max(0, self.exit_selected - 1)
+            elif key in (10, 13, curses.KEY_ENTER):
+                address = node_ip(self.options[self.exit_selected])
+                self.action(control, ["set", f"--exit-node={address}"])
+                self.choosing = False
+            return True
+        if key in (curses.KEY_DOWN, ord("j")):
+            self.selected = min(self.selected + 1, max(0, len(nodes) - 1))
+        elif key in (curses.KEY_UP, ord("k")):
+            self.selected = max(0, self.selected - 1)
+        elif key in (10, 13, curses.KEY_ENTER, ord("p")):
+            self.ping(nodes[self.selected:self.selected + 1])
+        elif key == ord("a"):
+            self.ping(nodes)
+        elif key == ord("r"):
+            self.next_refresh = 0
+        elif key == ord("e"):
+            self.choosing = True
+            self.exit_selected = 0
+            self.options = self.exit_options()
+        elif key == ord("c"):
+            if self.status.get("BackendState") == "Running":
+                self.action(control, ["down"])
+            else:
+                self.action(connect, self.status.copy())
+        elif key == ord("l"):
+            url = self.status.get("AuthURL", "")
+            parsed = urlsplit(url)
+            if parsed.scheme == "https" and parsed.hostname:
+                self.action(lambda: subprocess.run(["xdg-open", url], check=True, timeout=8, capture_output=True) and "Открыта страница входа")
+            else:
+                self.message = "Для получения ссылки входа нажмите c (Connect)"
+        elif key == ord("y") and nodes:
+            address = node_ip(nodes[self.selected])
+            if address:
+                def copy_ip():
+                    subprocess.run(["wl-copy", "--", address], check=True, timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                    return "IP скопирован: " + address
+                self.action(copy_ip)
+        if nodes:
+            self.selected_ip = node_ip(nodes[self.selected])
+        return True
+
+    def loop(self):
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        curses.use_default_colors()
+        for index, color in enumerate((curses.COLOR_GREEN, curses.COLOR_RED, curses.COLOR_YELLOW, curses.COLOR_MAGENTA, 8 if curses.COLORS >= 16 else curses.COLOR_WHITE), 1):
+            curses.init_pair(index, color, -1)
+        curses.init_pair(6, curses.COLOR_WHITE, curses.COLOR_BLUE)
+        curses.mousemask(curses.ALL_MOUSE_EVENTS)
+        curses.mouseinterval(0)
+        self.screen.timeout(100)
+        self.screen.keypad(True)
+        try:
+            while True:
+                self.receive()
+                if time.monotonic() >= self.next_refresh and not self.refreshing:
+                    self.refreshing = True
+                    self.next_refresh = time.monotonic() + REFRESH_SECONDS
+                    self.submit("status", None, read_status)
+                self.draw()
+                if not self.handle(self.screen.getch()):
+                    break
+        finally:
+            self.pool.shutdown(wait=False, cancel_futures=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--waybar", action="store_true", help="Вывести JSON для индикатора Waybar")
+    modes.add_argument("--tui", action="store_true", help="Открыть мониторинг в текущем терминале")
+    modes.add_argument("--toggle", action="store_true", help="Показать/скрыть scratchpad (по умолчанию)")
+    parser.add_argument("--scratchpad", action="store_true", help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    if args.waybar:
+        print(json.dumps(waybar_status(read_status()), ensure_ascii=False))
+    elif args.tui:
+        locale.setlocale(locale.LC_ALL, "")
+        curses.wrapper(lambda screen: Panel(screen, scratchpad=args.scratchpad).loop())
+    else:
+        toggle_panel()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(0)
+    except (OSError, ValueError, RuntimeError, StopIteration, curses.error, subprocess.SubprocessError) as error:
+        message = clean(error) or "Не удалось открыть панель Tailscale"
+        print("tailscale-panel: " + message, file=sys.stderr)
+        if "--waybar" not in sys.argv and "--tui" not in sys.argv and shutil.which("notify-send"):
+            subprocess.run(["notify-send", "-u", "critical", "Tailscale", message], check=False)
+        sys.exit(1)

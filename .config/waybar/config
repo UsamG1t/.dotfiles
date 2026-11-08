@@ -15,6 +15,7 @@
     "custom/notifications",
     "bluetooth",
     "network",
+    "custom/tailscale",
     "battery",
     "tray"
   ],
@@ -60,6 +61,14 @@
     "format-off":         "󰤭  Off",
     "tooltip-format": "{ifname}\n{ipaddr}/{cidr}\n{signalStrength}%",
     "on-click": "kitty --class nmtui-popup --title 'Network' nmtui"
+  },
+
+  "custom/tailscale": {
+    "format": "{}",
+    "return-type": "json",
+    "exec": "tailscale-panel --waybar",
+    "interval": 3,
+    "on-click": "tailscale-panel --toggle"
   },
 
   "battery": {

@@ -48,6 +48,7 @@
 - sudo
 - swaync
 - systemd
+- tailscale
 - thunderbird
 - ttf-dejavu
 - ttf-hack-nerd

@@ -18,7 +18,7 @@ PYTHON_SETUP = REPO_DIR / "setup/python-env.py"
 HYPRLAND_SCRIPTS = (
     "calendar-popup", "firefox-here", "lock-screen", "notifications-status",
     "screenshot", "send-home-or-other", "show-hints", "sublime-here",
-    "thunderbird-here", "toggle-bluetooth", "toggle-btop", "toggle-scratchpad",
+    "thunderbird-here", "toggle-bluetooth", "toggle-btop", "toggle-scratchpad", "tailscale-panel",
     "wallpaper-daemon", "window-double", "window-half",
 )
 HYPRLAND_IGNORES = (

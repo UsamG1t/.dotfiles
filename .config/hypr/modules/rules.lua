@@ -104,6 +104,17 @@ hl.window_rule({
     center = true,
 })
 
+-- Tailscale: отдельный scratchpad поверх текущего рабочего стола.
+-- Точное положение при каждом открытии вычисляет tailscale-panel.
+hl.window_rule({
+    name = "tailscale-popup",
+    match = { class = "tailscale-popup" },
+    workspace = "special:tailscale silent",
+    float = true,
+    size = "50% 50%",
+    move = "monitor_w-window_w-12 40",
+})
+
 -- Всплывающая подсказка по кейбиндам (Super+Shift+/)
 
 hl.window_rule({

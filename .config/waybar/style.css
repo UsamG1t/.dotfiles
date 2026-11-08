@@ -28,6 +28,7 @@ window#waybar {
 
 #clock,
 #network,
+#custom-tailscale,
 #battery,
 #tray, 
 #custom-notifications {
@@ -36,6 +37,7 @@ window#waybar {
  
 #clock:hover,
 #network:hover,
+#custom-tailscale:hover,
 #custom-notifications:hover {
     background: rgba(255, 255, 255, 0.07);
 }
@@ -65,4 +67,28 @@ window#waybar {
 #bluetooth.off,
 #bluetooth.disabled {
     color: #666666;
+}
+
+#custom-tailscale.off {
+    color: #666666;
+}
+
+#custom-tailscale.connecting {
+    color: #D4A020;
+}
+
+#custom-tailscale.connected {
+    color: #70c987;
+}
+
+#custom-tailscale.exit {
+    color: #b77aef;
+}
+
+#custom-tailscale.warning {
+    color: #D4A020;
+}
+
+#custom-tailscale.error {
+    color: #ef6b73;
 }

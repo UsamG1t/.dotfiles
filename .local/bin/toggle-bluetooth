@@ -1,21 +1,915 @@
-#!/usr/bin/env bash
-# toggle-bluetooth — открыть/закрыть TUI управления bluetooth
-# Install: cp toggle-bluetooth ~/.local/bin/ && chmod +x ~/.local/bin/toggle-bluetooth
+#!/usr/bin/env python3
+"""Bluetooth TUI: устройства, быстрые действия и живая консоль bluetoothctl."""
 
-CLASS="bluetooth-popup"
+import argparse
+import codecs
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+import curses
+import fcntl
+import json
+import locale
+import os
+from pathlib import Path
+import pty
+import re
+import shutil
+import signal
+import struct
+import subprocess
+import sys
+import tempfile
+import termios
+import time
+import unicodedata
 
-if hyprctl clients -j 2>/dev/null | grep -qE '"class"\s*:\s*"'"$CLASS"'"'; then
-    hyprctl dispatch "hl.dsp.window.close({window = 'class:$CLASS'})"
-    exit 0
-fi
 
-# Включаем bluetooth если выключен
-bluetoothctl power on 2>/dev/null
+WINDOW_CLASS = "bluetooth-popup"
+WORKSPACE = "special:bluetooth"
+ANSI = re.compile(r"\x1b\][^\x07]*(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -/]*[@-~]")
+PROMPT = re.compile(r"\[[^\]\r\n]*\](?:>|#)\s*")
+MAC = re.compile(r"[0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5}\Z")
 
-# Открываем TUI (bluetuith из AUR; запасной — blueman-manager)
-if command -v bluetuith &>/dev/null; then
-    kitty --class "$CLASS" --title "Bluetooth" bluetuith
-else
-    # fallback: bluetoothctl в интерактивном режиме
-    kitty --class "$CLASS" --title "Bluetooth" bluetoothctl
-fi
+
+def clean(text):
+    return " ".join("".join(c if c.isprintable() else " " for c in ANSI.sub("", str(text))).split())
+
+
+def fit(text, width):
+    result, used = "", 0
+    for char in str(text):
+        if not char.isprintable() and unicodedata.category(char) != "Co":
+            char = " "
+        cells = 0 if unicodedata.combining(char) else 2 if unicodedata.east_asian_width(char) in "WF" else 1
+        if used + cells > width:
+            break
+        result += char
+        used += cells
+    return result + " " * max(0, width - used)
+
+
+def run(command, timeout=8):
+    result = subprocess.run(command, capture_output=True, text=True, timeout=timeout, env={**os.environ, "LC_ALL": "C"})
+    if result.returncode:
+        raise RuntimeError(clean(result.stderr or result.stdout))
+    return result.stdout
+
+
+def device_name(device):
+    return clean(device.get("Alias") or device.get("Name") or device.get("Address") or "Без имени")
+
+
+def read_objects():
+    output = run(["busctl", "--system", "--json=short", "call", "org.bluez", "/",
+                  "org.freedesktop.DBus.ObjectManager", "GetManagedObjects"])
+    adapters, devices = [], []
+    for path, interfaces in json.loads(output)["data"][0].items():
+        for interface, target in (("org.bluez.Adapter1", adapters), ("org.bluez.Device1", devices)):
+            if interface not in interfaces:
+                continue
+            props = {key: value["data"] for key, value in interfaces[interface].items()}
+            props["path"] = path
+            battery = interfaces.get("org.bluez.Battery1", {}).get("Percentage")
+            if battery:
+                props["Battery"] = battery["data"]
+            target.append(props)
+    adapters.sort(key=lambda a: a["path"])
+    devices.sort(key=lambda d: (not d.get("Connected"), not d.get("Paired"), device_name(d).casefold(), d.get("Address", "")))
+    return adapters, devices
+
+
+def service_state():
+    output = run(["systemctl", "show", "bluetooth.service", "--property=LoadState,ActiveState,SubState", "--no-pager"])
+    return dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
+
+
+def radio_blocks():
+    return [d for d in json.loads(run(["rfkill", "--json", "--output", "ID,TYPE,DEVICE,SOFT,HARD"]))["rfkilldevices"] if d["type"] == "bluetooth"]
+
+
+def read_state():
+    service = service_state()
+    # Запрос к org.bluez при остановленной службе может сам запустить её через D-Bus.
+    adapters, devices = read_objects() if service.get("ActiveState") == "active" else ([], [])
+    return service, radio_blocks(), adapters, devices
+
+
+def system_control(command):
+    command = [shutil.which(command[0]) or command[0], *command[1:]]
+    result = subprocess.run(command, capture_output=True, text=True, timeout=15, env={**os.environ, "LC_ALL": "C"})
+    error = clean(result.stderr or result.stdout)
+    denied = ("permission denied", "access denied", "authentication is required", "authentication required", "not authorized", "not permitted")
+    if result.returncode and any(text in error.lower() for text in denied):
+        if not shutil.which("pkexec"):
+            raise RuntimeError("Для запроса прав администратора нужен polkit (pkexec)")
+        result = subprocess.run(["pkexec", *command], capture_output=True, text=True, timeout=120)
+        error = clean(result.stderr or result.stdout)
+    if result.returncode:
+        raise RuntimeError(error or "Команда не выполнена")
+    return "Готово"
+
+
+def change_service(start):
+    if start:
+        system_control(["systemctl", "--no-ask-password", "--runtime", "unmask", "bluetooth.service"])
+        system_control(["systemctl", "--no-ask-password", "start", "bluetooth.service"])
+    else:
+        # Обычный stop отменяется D-Bus-клиентами (например, WirePlumber).
+        # Блокировка только до перезагрузки; запуск из панели снимает её.
+        system_control(["systemctl", "--no-ask-password", "--runtime", "--now", "mask", "bluetooth.service"])
+    state = service_state().get("ActiveState")
+    if state != ("active" if start else "inactive"):
+        raise RuntimeError("Состояние bluetooth.service: " + str(state))
+    return "Служба Bluetooth запущена" if start else "Служба Bluetooth остановлена"
+
+
+def change_power(adapter):
+    enable = not adapter.get("Powered")
+    if enable and service_state().get("ActiveState") != "active":
+        change_service(True)
+    if not adapter:
+        deadline = time.monotonic() + 4
+        while time.monotonic() < deadline:
+            adapters, _ = read_objects()
+            if adapters:
+                adapter = adapters[0]
+                break
+            time.sleep(.2)
+    if not adapter:
+        raise RuntimeError("Служба запущена, но Bluetooth-адаптер не найден")
+    if enable:
+        device = Path(adapter["path"]).name
+        block = next((d for d in radio_blocks() if d["device"] == device), None)
+        if block and block["hard"] == "blocked":
+            raise RuntimeError("Bluetooth заблокирован аппаратно: отключите режим полёта или аппаратный переключатель")
+        if block and block["soft"] == "blocked":
+            system_control(["rfkill", "unblock", str(int(block["id"]))])
+    system_control(["busctl", "--system", "set-property", "org.bluez", adapter["path"], "org.bluez.Adapter1", "Powered", "b", "true" if enable else "false"])
+    return "Bluetooth включён" if enable else "Bluetooth выключен"
+
+
+def help_row(raw):
+    # Сигнатура выделена цветом. Это позволяет разобрать даже очень длинные аргументы.
+    colored = re.search(r"\x1b\[[0-9;]*m([^\x1b]+)\x1b\[0m(.*)", raw)
+    if colored:
+        signature, description = map(clean, colored.groups())
+    else:
+        parts = re.split(r" {2,}|\t+", ANSI.sub("", raw).strip(), maxsplit=1)
+        if len(parts) != 2:
+            return None
+        signature, description = map(clean, parts)
+    if not re.match(r"^[a-z][a-z0-9-]*(?:\s|$)", signature) or not description:
+        return None
+    return {"signature": signature, "name": signature.split()[0], "description": description,
+            "submenu": signature == signature.split()[0] and description.lower().endswith("submenu")}
+
+
+class Output:
+    """Поток PTY: help текущего меню, ответы команд, события и вопросы агента."""
+    def __init__(self):
+        self.menu = "main"
+        self.controller_address = ""
+        self.entries = []
+        self.logs = deque(maxlen=300)
+        self.errors = deque(maxlen=20)
+        self.pair_success = 0
+        self.prompt = ""
+        self.buffer = ""
+        self.collecting = False
+        self.new_entries = []
+        self.decoder = codecs.getincrementaldecoder("utf-8")("replace")
+
+    def line(self, raw):
+        raw = raw.rsplit("\r", 1)[-1]
+        text = clean(raw)
+        controller = re.match(r"^Controller ([0-9A-Fa-f:]{17}) .*\[default\]$", text)
+        if controller:
+            self.controller_address = controller[1]
+        heading = re.fullmatch(r"Menu (.+):", text)
+        if heading:
+            self.menu, self.new_entries, self.collecting = heading[1], [], True
+        elif self.collecting:
+            entry = help_row(raw)
+            if entry:
+                self.new_entries.append(entry)
+        elif text and not PROMPT.fullmatch(text):
+            self.logs.append(text)
+            if "failed" in text.lower() or "not available" in text.lower():
+                self.errors.append((time.monotonic(), text))
+        if text == "Request canceled":
+            self.prompt = ""
+        elif text == "Pairing successful":
+            self.pair_success = time.monotonic()
+
+    def feed(self, data):
+        self.buffer += self.decoder.decode(data)
+        self.buffer = self.buffer.replace("\r\n", "\n")
+        while "\n" in self.buffer:
+            line, self.buffer = self.buffer.split("\n", 1)
+            self.line(line)
+        tail = ANSI.sub("", self.buffer).rsplit("\r", 1)[-1]
+        if PROMPT.fullmatch(tail.strip()):
+            if self.collecting:
+                self.entries, self.collecting = self.new_entries, False
+            self.prompt, self.buffer = "", ""
+        elif re.match(r"\[[^\]]+\]\s+.+[:?]\s*$", tail):
+            self.prompt = clean(tail)
+        if len(self.buffer) > 65536:
+            self.logs.append(clean(tail[-4096:]))
+            self.buffer = ""
+
+
+class Session:
+    def __init__(self):
+        self.output = Output()
+        self.cache = tempfile.TemporaryDirectory(prefix="bluetooth-panel-")
+        self.fd, slave = pty.openpty()
+        try:
+            attrs = termios.tcgetattr(slave)
+            attrs[3] &= ~termios.ECHO
+            termios.tcsetattr(slave, termios.TCSANOW, attrs)
+            fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 512, 0, 0))
+            self.process = subprocess.Popen(
+                ["bluetoothctl", "--agent", "KeyboardDisplay"], stdin=slave, stdout=slave, stderr=slave,
+                env={**os.environ, "TERM": "dumb", "LC_ALL": "C", "XDG_CACHE_HOME": self.cache.name},
+                start_new_session=True,
+            )
+        except BaseException:
+            os.close(self.fd)
+            self.cache.cleanup()
+            raise
+        finally:
+            os.close(slave)
+        os.set_blocking(self.fd, False)
+        self.send("help", log=False)
+
+    def send(self, command, *, log=True, reply=False):
+        if any(ord(c) < 32 or ord(c) == 127 for c in command) or len(command.encode()) > 4000:
+            raise ValueError("Команда должна быть одной строкой без управляющих символов")
+        if self.output.prompt and not reply:
+            raise RuntimeError("Сначала ответьте на вопрос bluetoothctl или отмените ввод через Esc")
+        os.write(self.fd, (command + "\n").encode())
+        if log:
+            self.output.logs.append("> " + ("[ответ отправлен]" if reply else clean(command)))
+        if reply:
+            self.output.buffer, self.output.prompt = "", ""
+
+    def poll(self):
+        for _ in range(32):
+            try:
+                chunk = os.read(self.fd, 65536)
+            except (BlockingIOError, OSError):
+                break
+            if not chunk:
+                break
+            self.output.feed(chunk)
+
+    def close(self):
+        if self.fd is None:
+            return
+        if self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait()
+        os.close(self.fd)
+        self.fd = None
+        self.cache.cleanup()
+
+
+def geometry(monitor):
+    width, height = monitor["width"], monitor["height"]
+    if monitor.get("transform", 0) % 2:
+        width, height = height, width
+    width, height = int(width / monitor.get("scale", 1)), int(height / monitor.get("scale", 1))
+    left, top, right, bottom = monitor.get("reserved", [0, 0, 0, 0])
+    w, h = (width - left - right) // 2, (height - top - bottom) // 2
+    return w, h, monitor["x"] + width - right - w - 12, monitor["y"] + top + 12
+
+
+def hypr(*arguments):
+    output = run(["hyprctl", *arguments])
+    if output.strip().lower().startswith("error"):
+        raise RuntimeError(clean(output))
+    return output
+
+
+def toggle():
+    runtime = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+    fd = os.open(runtime / "bluetooth-panel.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        monitor = next(m for m in json.loads(hypr("-j", "monitors")) if m.get("focused"))
+        if monitor.get("specialWorkspace", {}).get("name") == WORKSPACE:
+            hypr("dispatch", 'hl.dsp.workspace.toggle_special("bluetooth")')
+            return
+        def find_window():
+            return next((w for w in json.loads(hypr("-j", "clients")) if w.get("class") == WINDOW_CLASS), None)
+        window = find_window()
+        if not window:
+            subprocess.Popen([
+                "kitty", "--class", WINDOW_CLASS, "--title", "Bluetooth",
+                "-o", "font_family=Hack Nerd Font Mono", "-o", "font_size=10", "-o", "window_padding_width=8",
+                "-o", "remember_window_size=no", "-o", "background_opacity=0.96",
+                "-o", "background=#141414", "-o", "foreground=#e0e0e0",
+                "-o", "color1=#ef6b73", "-o", "color2=#70c987", "-o", "color3=#d4a020",
+                "-o", "color4=#322a3b", "-o", "color5=#b77aef", "-o", "color8=#888888",
+                sys.executable, str(Path(__file__).resolve()), "--tui", "--scratchpad",
+            ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            deadline = time.monotonic() + 5
+            while not window and time.monotonic() < deadline:
+                time.sleep(0.05)
+                window = find_window()
+            if not window:
+                raise RuntimeError("Kitty не открыл Bluetooth-панель")
+        selector, name = json.dumps("address:" + window["address"]), json.dumps(monitor["name"])
+        w, h, x, y = geometry(monitor)
+        hypr("eval", f'''
+            hl.dispatch(hl.dsp.workspace.move({{workspace="special:bluetooth", monitor={name}}}))
+            hl.dispatch(hl.dsp.workspace.toggle_special("bluetooth"))
+            hl.dispatch(hl.dsp.window.resize({{window={selector}, x={w}, y={h}, relative=false}}))
+            hl.dispatch(hl.dsp.window.move({{window={selector}, x={x}, y={y}, relative=false}}))
+            hl.dispatch(hl.dsp.window.alter_zorder({{window={selector}, mode="top"}}))
+            hl.dispatch(hl.dsp.focus({{window={selector}}}))
+        ''')
+
+
+class Panel:
+    def __init__(self, screen, session, *, scratchpad=False):
+        self.screen, self.session, self.scratchpad = screen, session, scratchpad
+        self.pool = ThreadPoolExecutor(max_workers=2)
+        self.future = None
+        self.action_future = None
+        self.generation = self.future_generation = 0
+        self.service = {"ActiveState": "unknown"}
+        self.blocks = []
+        self.idle_output = Output()
+        self.next_refresh = 0
+        self.adapters, self.devices = [], []
+        self.adapter_path = ""
+        self.selected_address = ""
+        self.selected = 0
+        self.mode, self.text, self.cursor, self.choice = "", "", 0, 0
+        self.offset = 0
+        self.log_view, self.log_offset = False, 0
+        self.buttons = []
+        self.message = "↑↓ выбрать · Enter подключить/отключить · ? команды · ! подменю"
+        self.scanner = None
+        self.scan_deadline = 0
+        self.connection = None
+        self.connection_scan = False
+        self.stopped = False
+
+    @property
+    def output(self):
+        return self.session.output if self.session else self.idle_output
+
+    def adapter(self):
+        return next((a for a in self.adapters if a["path"] == self.adapter_path), {})
+
+    def visible_devices(self):
+        return [d for d in self.devices if d.get("Adapter") == self.adapter_path]
+
+    def refresh(self):
+        if self.action_future and self.action_future.done():
+            try:
+                self.message = self.action_future.result()
+            except Exception as error:
+                self.message = clean(error)
+            self.output.logs.append(self.message)
+            self.action_future = None
+            self.next_refresh = 0
+        if self.future and self.future.done():
+            try:
+                if self.future_generation != self.generation:
+                    self.future = None
+                    self.next_refresh = 0
+                    return
+                state = self.future.result()
+                self.service, self.blocks, self.adapters, self.devices = state
+                if not self.action_future:
+                    if self.service.get("ActiveState") == "active" and not self.session:
+                        self.session = Session()
+                    elif self.service.get("ActiveState") != "active":
+                        self.disconnect_session()
+                preferred = next((a for a in self.adapters if a.get("Address") == self.output.controller_address), None)
+                if preferred:
+                    self.adapter_path = preferred["path"]
+                if not any(a["path"] == self.adapter_path for a in self.adapters):
+                    self.adapter_path = self.adapters[0]["path"] if self.adapters else ""
+                devices = self.visible_devices()
+                self.selected = next((i for i, d in enumerate(devices) if d["Address"] == self.selected_address), min(self.selected, max(0, len(devices) - 1)))
+            except Exception as error:
+                self.message = clean(error)
+            self.future = None
+        if time.monotonic() >= self.next_refresh and not self.future and not self.action_future:
+            self.future_generation = self.generation
+            self.future = self.pool.submit(read_state)
+            self.next_refresh = time.monotonic() + 3
+        if self.scanner:
+            self.scanner.poll()
+            failures = [line for line in self.scanner.output.logs if "failed" in line.lower()]
+            self.scanner.output.logs.clear()
+            if failures:
+                self.output.logs.extend(failures)
+                self.message = failures[-1]
+            if failures or self.scanner.process.poll() is not None or time.monotonic() >= self.scan_deadline:
+                self.stop_scan()
+        self.progress_connection()
+
+    def disconnect_session(self):
+        self.connection, self.connection_scan = None, False
+        self.stop_scan()
+        if self.session:
+            self.idle_output.logs.extend(self.output.logs)
+            self.session.close()
+            self.session = None
+        self.mode, self.text = "", ""
+
+    def start_action(self, function, *args):
+        if self.action_future:
+            self.message = "Предыдущая операция ещё выполняется"
+            return
+        self.generation += 1
+        self.message = "Выполняется… При необходимости появится графический запрос прав"
+        self.action_future = self.pool.submit(function, *args)
+
+    def toggle_service(self):
+        if self.action_future:
+            return
+        start = self.service.get("ActiveState") != "active"
+        # Иначе живой клиент bluetoothctl может снова активировать org.bluez.
+        if not start:
+            self.disconnect_session()
+            self.adapters, self.devices = [], []
+        self.start_action(change_service, start)
+
+    def stop_scan(self):
+        if self.scanner:
+            self.scanner.close()
+            self.scanner = None
+            self.next_refresh = 0
+
+    def scan(self):
+        if self.scanner:
+            self.stop_scan()
+            self.message = "Поиск остановлен"
+        elif not self.adapter().get("Powered"):
+            self.message = "Сначала включите адаптер: O / Power"
+        else:
+            # Отдельный клиент держит discovery только выбранного адаптера.
+            self.scanner = Session()
+            self.scanner.send("select " + self.adapter()["Address"])
+            self.scanner.send("scan on")
+            self.scan_deadline = time.monotonic() + 30
+            self.message = "Поиск устройств: 30 секунд; S — остановить раньше"
+
+    def connect_device(self, device):
+        if self.connection:
+            self.message = "Дождитесь завершения текущего сопряжения/подключения"
+            return
+        address = device["Address"]
+        if not MAC.fullmatch(address):
+            raise ValueError("Некорректный адрес устройства")
+        if not self.adapter().get("Powered"):
+            self.message = "Сначала O / Power — включить Bluetooth"
+            return
+        paired = device.get("Paired", False)
+        if paired and device.get("Connected"):
+            self.command("disconnect " + address)
+            return
+        if not paired:
+            # BLE Pair требует свежего scan report. Не останавливаем поиск на середине сопряжения.
+            if not self.scanner:
+                self.scan()
+                self.connection_scan = True
+            self.scan_deadline = max(self.scan_deadline, time.monotonic() + 90)
+        self.command(("connect " if paired else "pair ") + address)
+        self.connection = {"address": address, "name": device_name(device), "stage": "connect" if paired else "pair",
+                           "started": time.monotonic(), "deadline": time.monotonic() + 90}
+        self.message = ("Подключение: " if paired else "Сопряжение: ") + device_name(device)
+
+    def finish_connection(self, message):
+        self.connection = None
+        if self.connection_scan:
+            self.stop_scan()
+        self.connection_scan = False
+        self.message = message
+        self.output.logs.append(message)
+
+    def progress_connection(self):
+        pending = self.connection
+        if not pending or self.output.prompt or self.action_future:
+            return
+        stage = pending["stage"]
+        tokens = {"pair": ("failed to pair", "not available"), "trust": ("failed", "not available"), "connect": ("failed to connect", "not available")}[stage]
+        failure = next((line for when, line in reversed(self.output.errors) if when >= pending["started"] and any(token in line.lower() for token in tokens)), None)
+        if failure:
+            self.finish_connection("Не удалось подключить " + pending["name"] + ": " + failure)
+            return
+        if time.monotonic() > pending["deadline"]:
+            self.finish_connection("Подключение не завершено: " + pending["name"] + ". Проверьте режим сопряжения и повторите C")
+            return
+        device = next((d for d in self.devices if d.get("Address") == pending["address"]), None)
+        if not device:
+            return
+        if stage == "pair" and device.get("Paired") and self.output.pair_success >= pending["started"]:
+            self.command("trust " + pending["address"])
+            pending["stage"], pending["started"] = "trust", time.monotonic()
+        elif stage == "trust" and device.get("Trusted"):
+            if not device.get("Connected") or not device.get("ServicesResolved"):
+                self.command("connect " + pending["address"])
+            pending["stage"], pending["started"] = "connect", time.monotonic()
+        elif stage == "connect" and device.get("Connected") and device.get("ServicesResolved"):
+            self.finish_connection("Подключено: " + pending["name"])
+
+    def command(self, text):
+        if self.action_future:
+            raise RuntimeError("Дождитесь завершения операции со службой или адаптером")
+        if not self.session:
+            raise RuntimeError("Служба Bluetooth остановлена: B — запустить, O — включить Bluetooth")
+        self.session.send(text)
+        if text.strip() in ("quit", "exit"):
+            self.stopped = True
+        self.next_refresh = 0
+        self.message = "Отправлено в bluetoothctl: " + text
+
+    def open_input(self, mode):
+        self.mode, self.text, self.cursor, self.choice = mode, "", 0, 0
+
+    def suggestions(self):
+        entries = [e for e in self.output.entries if e["submenu"] == (self.mode == "!")]
+        prefix = self.text.split()[0] if self.text.strip() else ""
+        return [e for e in entries if e["name"].startswith(prefix)]
+
+    def submit_input(self):
+        text = self.text.strip()
+        if not text:
+            self.message = "Введите команду или используйте ↑↓ и Tab"
+            return
+        if self.mode == "reply":
+            self.session.send(text, reply=True)
+        elif self.mode == "!":
+            if not any(e["submenu"] and e["name"] == text for e in self.output.entries):
+                self.message = "Выберите точное имя подменю из списка"
+                return
+            self.command("menu " + text)
+        else:
+            self.command(text)
+        self.mode, self.text, self.cursor = "", "", 0
+
+    def cancel_input(self):
+        if self.mode == "reply":
+            if self.connection:
+                self.finish_connection("Сопряжение отменено")
+            if "yes/no" in self.output.prompt.lower():
+                self.session.send("no", reply=True)
+            else:
+                # Закрытие нашего агента отменяет PIN-запрос, не отправляя ложный PIN.
+                self.session.close()
+                self.session = Session()
+                address = self.adapter().get("Address", "")
+                if MAC.fullmatch(address):
+                    self.session.send("select " + address)
+            self.message = "Запрос отменён"
+        self.mode, self.text, self.cursor = "", "", 0
+
+    def complete(self):
+        entries = self.suggestions()
+        if entries:
+            entry = entries[min(self.choice, len(entries) - 1)]
+            self.text = entry["name"] + (" " if self.mode == "?" and entry["signature"] != entry["name"] else "")
+            self.cursor = len(self.text)
+
+    def edit(self, key):
+        if key == 27:
+            self.cancel_input()
+        elif key in (10, 13, curses.KEY_ENTER):
+            self.submit_input()
+        elif key in (curses.KEY_BACKSPACE, 127, 8):
+            if self.cursor:
+                self.text = self.text[:self.cursor - 1] + self.text[self.cursor:]
+                self.cursor -= 1
+            self.choice = 0
+        elif key == curses.KEY_DC:
+            self.text = self.text[:self.cursor] + self.text[self.cursor + 1:]
+        elif key == curses.KEY_LEFT:
+            self.cursor = max(0, self.cursor - 1)
+        elif key == curses.KEY_RIGHT:
+            self.cursor = min(len(self.text), self.cursor + 1)
+        elif key in (curses.KEY_HOME, 1):
+            self.cursor = 0
+        elif key in (curses.KEY_END, 5):
+            self.cursor = len(self.text)
+        elif key == 21:
+            self.text, self.cursor, self.choice = "", 0, 0
+        elif key == curses.KEY_UP:
+            self.choice = max(0, self.choice - 1)
+        elif key == curses.KEY_DOWN:
+            self.choice = min(self.choice + 1, max(0, len(self.suggestions()) - 1))
+        elif key == 9 and self.mode != "reply":
+            self.complete()
+        elif isinstance(key, str) and key.isprintable() and len(self.text.encode()) < 3900:
+            self.text = self.text[:self.cursor] + key + self.text[self.cursor:]
+            self.cursor += len(key)
+            self.choice = 0
+        return True
+
+    def handle(self, key):
+        if key == curses.KEY_MOUSE:
+            try:
+                _, x, y, _, state = curses.getmouse()
+            except curses.error:
+                return True
+            if state & curses.BUTTON4_PRESSED:
+                key = curses.KEY_UP
+            elif state & getattr(curses, "BUTTON5_PRESSED", 0):
+                key = curses.KEY_DOWN
+            elif state & (curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED | curses.BUTTON1_DOUBLE_CLICKED):
+                button = next((b for b in self.buttons if b[0] == y and b[1] <= x < b[2]), None)
+                if not button:
+                    return True
+                key = button[3]
+                if isinstance(key, tuple):
+                    kind, index = key
+                    if kind == "device":
+                        self.selected = index
+                        self.selected_address = self.visible_devices()[index]["Address"]
+                    else:
+                        if not self.mode:
+                            self.open_input("?")
+                        self.choice = index
+                        self.complete()
+                    return True
+            else:
+                return True
+        if self.mode:
+            return self.edit(key)
+        if key in ("?", "!"):
+            self.open_input(key)
+        elif key == "b":
+            self.toggle_service()
+        elif key == "o":
+            self.start_action(change_power, self.adapter().copy())
+        elif key == "l":
+            self.log_view, self.log_offset = not self.log_view, 0
+        elif key in (curses.KEY_PPAGE, curses.KEY_NPAGE):
+            self.log_view = True
+            self.log_offset = max(0, self.log_offset + (10 if key == curses.KEY_PPAGE else -10))
+        elif key in (27, "q"):
+            if self.log_view:
+                self.log_view = False
+            elif self.output.menu != "main":
+                self.command("back")
+            elif self.scratchpad:
+                hypr("dispatch", 'hl.dsp.workspace.toggle_special("bluetooth")')
+            else:
+                return False
+        elif key in (curses.KEY_BACKSPACE, 127, 8) and self.output.menu != "main":
+            self.command("back")
+        elif self.log_view:
+            if key == "r":
+                self.log_offset, self.next_refresh = 0, 0
+            elif key in (curses.KEY_UP, "k"):
+                self.log_offset = min(len(self.output.logs), self.log_offset + 1)
+            elif key in (curses.KEY_DOWN, "j"):
+                self.log_offset = max(0, self.log_offset - 1)
+        elif self.output.menu != "main":
+            if key == "r":
+                self.command("help")
+            elif key == curses.KEY_UP:
+                self.offset = max(0, self.offset - 1)
+            elif key == curses.KEY_DOWN:
+                self.offset += 1
+        else:
+            devices = self.visible_devices()
+            device = devices[self.selected] if devices and self.selected < len(devices) else None
+            if key in (curses.KEY_UP, "k"):
+                self.selected = max(0, self.selected - 1)
+            elif key in (curses.KEY_DOWN, "j"):
+                self.selected = min(self.selected + 1, max(0, len(devices) - 1))
+            elif key == "r":
+                self.next_refresh = 0
+            elif key == "s":
+                self.scan()
+            elif key == "a" and self.adapters:
+                index = next(i for i, a in enumerate(self.adapters) if a["path"] == self.adapter_path)
+                self.adapter_path = self.adapters[(index + 1) % len(self.adapters)]["path"]
+                self.selected, self.selected_address = 0, ""
+                self.command("select " + self.adapter()["Address"])
+            elif device and MAC.fullmatch(device.get("Address", "")):
+                address = device["Address"]
+                if key in (10, 13, curses.KEY_ENTER, "c"):
+                    self.connect_device(device)
+                elif key == "p":
+                    if device.get("Paired"):
+                        self.message = "Устройство уже сопряжено; C — подключить"
+                    else:
+                        self.connect_device(device)
+                elif key == "t":
+                    self.command(("untrust " if device.get("Trusted") else "trust ") + address)
+                elif key == "i":
+                    self.command("info " + address)
+                    self.log_view, self.log_offset = True, 0
+            if devices and self.selected < len(devices):
+                self.selected_address = devices[self.selected]["Address"]
+        return True
+
+    def put(self, y, x, text, color=0, width=None):
+        height, columns = self.screen.getmaxyx()
+        if not (0 <= y < height and 0 <= x < columns - 1):
+            return
+        try:
+            self.screen.addstr(y, x, fit(text, min(width if width is not None else columns - x - 1, columns - x - 1)), color)
+        except curses.error:
+            pass
+
+    def button(self, y, x, label, key):
+        self.put(y, x, label, curses.color_pair(4), len(label))
+        self.buttons.append((y, x, x + len(label), key))
+
+    def draw(self):
+        self.screen.erase()
+        height, width = self.screen.getmaxyx()
+        self.buttons = []
+        adapter = self.adapter()
+        self.put(0, 1, "󰂯 BLUETOOTH   " + ("Включён" if adapter.get("Powered") else "Выключен") + "   / " + self.output.menu, curses.color_pair(4) | curses.A_BOLD)
+        self.put(1, 1, f"Адаптер: {device_name(adapter)}   {adapter.get('Address', '—')}   " + ("Поиск…" if adapter.get("Discovering") else ""))
+        state = self.service.get("ActiveState", "unknown")
+        if state != "active":
+            label = {"inactive": "остановлена", "failed": "ошибка", "activating": "запускается", "deactivating": "останавливается", "unknown": "проверяется"}.get(state, state)
+            self.put(2, 1, "Служба Bluetooth: " + label + " · B — запустить · O — включить службу и радио", curses.color_pair(3))
+        elif not self.adapters:
+            self.put(2, 1, "Нет доступных адаптеров; проверьте службу bluetooth", curses.color_pair(3))
+        elif adapter.get("PowerState") == "off-blocked":
+            self.put(2, 1, "Служба работает · радио заблокировано · O / Power — разблокировать и включить", curses.color_pair(3))
+        else:
+            self.put(2, 1, "Служба Bluetooth: работает", curses.color_pair(5))
+        if self.mode:
+            self.button(3, 1, "[Esc Cancel input]", 27)
+        else:
+            self.button(3, 1, "[R Refresh]", "r")
+            self.button(3, 15, "[? Commands]", "?")
+            self.button(3, 31, "[! Submenus]", "!")
+        if self.output.menu == "main" and not self.mode and not self.log_view:
+            self.button(3, 48, "[S Stop scan]" if self.scanner else "[S Scan 30s]", "s")
+            self.button(3, 65, "[O Power]", "o")
+            self.button(3, 78, "[A Adapter]", "a")
+            self.button(4, 1, "[C Connect / Disconnect]", "c")
+            self.button(4, 28, "[P Pair]", "p")
+            self.button(4, 41, "[T Trust]", "t")
+            self.button(4, 55, "[I Info]", "i")
+        elif not self.mode:
+            self.button(4, 1, "[Esc Back]", 27)
+        if not self.mode:
+            self.button(4, 68, "[L Log / Back]", "l")
+            self.button(4, 85, "[B Stop service]" if state == "active" else "[B Start service]", "b")
+        if height < 14 or width < 60:
+            self.put(6, 1, "Увеличьте окно: нужно хотя бы 60×14 ячеек", curses.color_pair(3))
+            self.screen.refresh()
+            return
+        rows = max(1, height - 14)
+        if self.log_view and self.mode not in ("?", "!"):
+            self.put(6, 1, "Ответы bluetoothctl · ↑↓ / PgUp PgDn прокрутка · L / Esc назад", curses.A_BOLD)
+            logs = list(self.output.logs)
+            self.log_offset = min(self.log_offset, max(0, len(logs) - rows))
+            start = max(0, len(logs) - rows - self.log_offset)
+            for row, line in enumerate(logs[start:start + rows], 7):
+                self.put(row, 1, line)
+        elif self.mode in ("?", "!") or self.output.menu != "main":
+            entries = self.suggestions() if self.mode in ("?", "!") else [e for e in self.output.entries if not e["submenu"]]
+            self.put(6, 1, "Подменю" if self.mode == "!" else "Команда и аргументы", curses.A_BOLD)
+            start = max(0, self.choice - rows + 1) if self.mode else min(self.offset, max(0, len(entries) - rows))
+            column = min(48, max(24, width // 2))
+            for row, entry in enumerate(entries[start:start + rows], 7):
+                index = start + row - 7
+                attr = curses.color_pair(6) if self.mode and index == self.choice else 0
+                self.put(row, 1, fit(entry["signature"], column) + " " + entry["description"], attr)
+                self.buttons.append((row, 1, width - 1, ("entry", index)))
+            if not entries:
+                self.put(7, 1, "Нет подменю в этом разделе; Esc — назад" if self.mode == "!" else "Нет совпадений; введённую команду всё равно можно отправить", curses.color_pair(5))
+            if entries:
+                detail = entries[min(self.choice, len(entries) - 1)]["signature"] if self.mode else f"Строки {start + 1}–{min(start + rows, len(entries))} из {len(entries)}"
+                self.put(height - 7, 1, detail + " · ↑↓ прокрутка · Tab дополнить", curses.color_pair(5))
+        else:
+            self.put(6, 1, fit("   Устройство", 31) + fit("Адрес", 20) + "Статус", curses.A_BOLD)
+            devices = self.visible_devices()
+            start = max(0, self.selected - rows + 1)
+            for row, device in enumerate(devices[start:start + rows], 7):
+                index = start + row - 7
+                connected = device.get("Connected") and device.get("Paired") and device.get("ServicesResolved")
+                label = "подключено" if connected else "сопряжено" if device.get("Paired") else "найдено"
+                if device.get("Connected") and not connected:
+                    label = "службы не готовы" if device.get("Paired") else "требуется сопряжение"
+                if self.connection and self.connection["address"] == device["Address"]:
+                    label = {"pair": "сопряжение…", "trust": "сохранение доверия…", "connect": "подключение…"}[self.connection["stage"]]
+                if device.get("Trusted"):
+                    label += " · доверенное"
+                if device.get("Blocked"):
+                    label += " · заблокировано"
+                if "Battery" in device:
+                    label += f" · {device['Battery']}%"
+                attr = curses.color_pair(6) if index == self.selected else curses.color_pair(1 if connected else 5)
+                self.put(row, 1, ("●  " if connected else "○  ") + fit(device_name(device), 28) + fit(device["Address"], 20) + label, attr)
+                self.buttons.append((row, 1, width - 1, ("device", index)))
+            if not devices:
+                self.put(7, 1, "Устройства пока не найдены · S — начать поиск", curses.color_pair(5))
+            elif self.selected < len(devices):
+                self.put(height - 7, 1, "Выбрано: " + device_name(devices[self.selected]), curses.color_pair(5))
+        if not self.log_view:
+            for row, line in enumerate(list(self.output.logs)[-3:], height - 6):
+                self.put(row, 1, line, curses.color_pair(2 if any(s in line.lower() for s in ("failed", "error", "invalid")) else 5))
+        self.put(height - 3, 1, self.output.prompt or self.message, curses.color_pair(3))
+        self.put(height - 1, 1, "? команды · ! подменю · Enter выполнить · Esc отменить ввод / назад · Ctrl+C закрыть", curses.color_pair(5))
+        try:
+            curses.curs_set(1 if self.mode else 0)
+        except curses.error:
+            pass
+        if self.mode:
+            prefix = "> " if self.mode == "reply" else ">" + self.mode
+            start = max(0, self.cursor - max(1, width - len(prefix) - 5))
+            self.put(height - 2, 1, prefix + self.text[start:], curses.color_pair(4))
+            try:
+                self.screen.move(height - 2, min(width - 2, 1 + len(prefix) + len(self.text[start:self.cursor])))
+            except curses.error:
+                pass
+        self.screen.refresh()
+
+    def loop(self):
+        curses.use_default_colors()
+        for index, color in enumerate((curses.COLOR_GREEN, curses.COLOR_RED, curses.COLOR_YELLOW, curses.COLOR_MAGENTA, 8 if curses.COLORS >= 16 else curses.COLOR_WHITE), 1):
+            curses.init_pair(index, color, -1)
+        curses.init_pair(6, curses.COLOR_WHITE, curses.COLOR_BLUE)
+        curses.set_escdelay(30)
+        curses.mousemask(curses.ALL_MOUSE_EVENTS)
+        curses.mouseinterval(0)
+        self.screen.timeout(100)
+        self.screen.keypad(True)
+        try:
+            while not self.stopped:
+                if self.session:
+                    self.session.poll()
+                    if self.session.process.poll() is not None:
+                        self.disconnect_session()
+                        self.next_refresh = 0
+                self.refresh()
+                if self.output.prompt and self.mode != "reply":
+                    self.open_input("reply")
+                elif not self.output.prompt and self.mode == "reply":
+                    self.mode, self.text, self.cursor = "", "", 0
+                self.draw()
+                try:
+                    key = self.screen.get_wch()
+                except curses.error:
+                    continue
+                if isinstance(key, str) and len(key) == 1 and ord(key) < 32:
+                    key = ord(key)
+                try:
+                    if not self.handle(key):
+                        break
+                except (OSError, ValueError, RuntimeError) as error:
+                    self.message = clean(error)
+        finally:
+            self.stop_scan()
+            if self.session:
+                self.session.close()
+            self.pool.shutdown(wait=False, cancel_futures=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--tui", action="store_true", help="Открыть панель в текущем терминале")
+    parser.add_argument("--scratchpad", action="store_true", help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    if args.tui:
+        if not shutil.which("bluetoothctl") or not shutil.which("busctl"):
+            raise RuntimeError("Нужны пакеты bluez-utils и systemd")
+        locale.setlocale(locale.LC_ALL, "")
+        session = Session() if service_state().get("ActiveState") == "active" else None
+        def tui(screen):
+            panel = Panel(screen, session, scratchpad=args.scratchpad)
+            for sig in (signal.SIGTERM, signal.SIGHUP):
+                signal.signal(sig, lambda *_: setattr(panel, "stopped", True))
+            panel.loop()
+        try:
+            curses.wrapper(tui)
+        finally:
+            if session and session.process.poll() is None:
+                session.close()
+    else:
+        toggle()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
+    except (OSError, ValueError, RuntimeError, StopIteration, curses.error, subprocess.SubprocessError) as error:
+        message = clean(error) or "Не удалось открыть Bluetooth-панель"
+        print("toggle-bluetooth: " + message, file=sys.stderr)
+        if "--tui" not in sys.argv and shutil.which("notify-send"):
+            subprocess.run(["notify-send", "-u", "critical", "Bluetooth", message], check=False)
+        sys.exit(1)

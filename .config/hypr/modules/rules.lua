@@ -100,8 +100,10 @@ center = true,
 hl.window_rule({
     name   = "bluetooth-popup",
     match  = { class = "bluetooth-popup" },
+    workspace = "special:bluetooth silent",
     float  = true,
-    center = true,
+    size   = "50% 50%",
+    move   = "monitor_w-window_w-12 40",
 })
 
 -- Tailscale: отдельный scratchpad поверх текущего рабочего стола.

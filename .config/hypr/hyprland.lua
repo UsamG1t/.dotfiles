@@ -159,7 +159,7 @@ hl.config({
         kb_layout  = "us,ru",
         kb_variant = "",
         kb_model   = "",
-        kb_options = "",
+        kb_options = "compose:ralt",
         kb_rules   = "",
 
         follow_mouse = 1,

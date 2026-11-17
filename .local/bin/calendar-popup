@@ -1,28 +1,614 @@
-#!/usr/bin/env bash
-# calendar-popup — toggle clock/calendar overlay
-# Install: cp calendar-popup ~/.local/bin/ && chmod +x ~/.local/bin/calendar-popup
+#!/usr/bin/env python3
+"""Today / Calendar / Timer — локальная календарная панель."""
 
-CLASS="calendar-popup"
+import argparse
+import calendar
+import curses
+from datetime import date, datetime, timedelta
+import fcntl
+import json
+import locale
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import textwrap
+import time
+import unicodedata
 
-if hyprctl clients -j 2>/dev/null | grep -qE '"class"\s*:\s*"'"$CLASS"'"'; then
-    hyprctl dispatch "hl.dsp.window.close({window = 'class:$CLASS'})"
-    exit 0
-fi
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'lib'))
+from calendar_panel import Agenda, duration, paths, private_dir, request, serve
 
-kitty \
-    --class "$CLASS" \
-    --title "Calendar" \
-    -o initial_window_width=26c \
-    -o initial_window_height=14c \
-    bash -c '
-while true; do
-    clear
-    printf "\n"
-    date "+   %A"
-    date "+   %d %B %Y"
-    printf "\n"
-    date "+   %H:%M:%S"
-    printf "\n"
-    cal
-    sleep 1
-done'
+
+SCRIPT = str(Path(__file__).resolve())
+PHASES = {'timer': 'Таймер', 'work': 'Работа', 'short': 'Короткий перерыв', 'long': 'Длинный перерыв'}
+WEEKDAYS = ('Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс')
+KITTY_STYLE = ['-o', 'font_family=Hack Nerd Font Mono', '-o', 'font_size=10', '-o', 'window_padding_width=8',
+               '-o', 'remember_window_size=no', '-o', 'background_opacity=0.97',
+               '-o', 'background=#141414', '-o', 'foreground=#e0e0e0', '-o', 'color1=#ef6b73',
+               '-o', 'color2=#70c987', '-o', 'color3=#d4a020', '-o', 'color4=#322a3b',
+               '-o', 'color5=#b77aef', '-o', 'color8=#888888']
+
+
+def clean(value):
+    return ''.join(c if c.isprintable() or unicodedata.category(c) == 'Co' else ' ' for c in str(value))
+
+
+def fit(text, width):
+    result, used = '', 0
+    for char in clean(text):
+        cells = 0 if unicodedata.combining(char) else 2 if unicodedata.east_asian_width(char) in 'WF' else 1
+        if used + cells > width:
+            break
+        result += char
+        used += cells
+    return result + ' ' * max(0, width - used)
+
+
+def stamp(seconds):
+    seconds = max(0, int(seconds))
+    hours, rest = divmod(seconds, 3600)
+    minutes, seconds = divmod(rest, 60)
+    return f'{hours:02}:{minutes:02}:{seconds:02}'
+
+
+def shift_month(day, offset):
+    serial = max(12, min(9999 * 12 + 11, day.year * 12 + day.month - 1 + offset))
+    year, month = divmod(serial, 12)
+    month += 1
+    return day.replace(year=year, month=month, day=min(day.day, calendar.monthrange(year, month)[1]))
+
+
+def hypr(*args):
+    result = subprocess.run(['hyprctl', *args], capture_output=True, text=True, timeout=4)
+    if result.returncode or result.stdout.strip().lower().startswith('error'):
+        raise RuntimeError(clean(result.stderr or result.stdout))
+    return result.stdout
+
+
+def window_geometry(monitor, alarm=False):
+    width, height = monitor['width'], monitor['height']
+    if monitor.get('transform', 0) % 2:
+        width, height = height, width
+    width, height = int(width / monitor.get('scale', 1)), int(height / monitor.get('scale', 1))
+    left, top, right, bottom = monitor.get('reserved', [0, 0, 0, 0])
+    available_w, available_h = width - left - right, height - top - bottom
+    w, h = int(available_w * (.55 if alarm else .60)), int(available_h * (.40 if alarm else .65))
+    x = monitor['x'] + left + (available_w - w) // 2 if alarm else monitor['x'] + width - right - w - 12
+    y = monitor['y'] + top + (available_h - h) // 2 if alarm else monitor['y'] + top + 12
+    return w, h, x, y
+
+
+def launch_window(alarm=False, alarm_id=''):
+    command = ['kitty', '--class', 'calendar-alarm' if alarm else 'calendar-popup',
+               '--title', 'Timer' if alarm else 'Calendar', *KITTY_STYLE, sys.executable, SCRIPT]
+    command.extend(['--alarm', alarm_id] if alarm else ['--tui', '--scratchpad'])
+    return subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def place_window(alarm=False):
+    cls = 'calendar-alarm' if alarm else 'calendar-popup'
+    workspace = 'calendar-alarm' if alarm else 'calendar'
+    monitor = next(m for m in json.loads(hypr('-j', 'monitors')) if m.get('focused'))
+    window = None
+    deadline = time.monotonic() + 4
+    while not window and time.monotonic() < deadline:
+        window = next((w for w in json.loads(hypr('-j', 'clients')) if w.get('class') == cls), None)
+        if not window:
+            time.sleep(.05)
+    if not window:
+        raise RuntimeError('Не найдено окно ' + cls)
+    w, h, x, y = window_geometry(monitor, alarm)
+    selector = json.dumps('address:' + window['address'])
+    # Special workspace рисуется и поверх полноэкранного приложения.
+    if monitor.get('specialWorkspace', {}).get('name') != 'special:' + workspace:
+        hypr('dispatch', f'hl.dsp.workspace.toggle_special("{workspace}")')
+    hypr('eval', f'''
+        hl.dispatch(hl.dsp.window.resize({{window={selector},x={w},y={h},relative=false}}))
+        hl.dispatch(hl.dsp.window.move({{window={selector},x={x},y={y},relative=false}}))
+        hl.dispatch(hl.dsp.window.alter_zorder({{window={selector},mode="top"}}))
+        hl.dispatch(hl.dsp.focus({{window={selector}}}))
+    ''')
+
+
+def ensure_daemon():
+    try:
+        return request()
+    except (OSError, ValueError):
+        pass
+    runtime = paths()['runtime']
+    private_dir(runtime)
+    with open(runtime / 'daemon.log', 'a') as log:
+        process = subprocess.Popen([sys.executable, SCRIPT, '--daemon'], stdin=subprocess.DEVNULL,
+                                   stdout=log, stderr=log, start_new_session=True)
+    deadline = time.monotonic() + 4
+    while time.monotonic() < deadline:
+        try:
+            return request()
+        except (OSError, ValueError):
+            if process.poll() not in (None, 0):
+                break
+            time.sleep(.05)
+    raise RuntimeError(f'Не удалось запустить таймер. Подробности: {runtime / "daemon.log"}')
+
+
+def alarm_callback(state):
+    title = 'Таймер завершён' if state['mode'] == 'timer' else 'Pomodoro: ' + PHASES[state['phase']] + ' — завершено'
+    subprocess.Popen(['notify-send', '-a', 'Calendar', '-u', 'critical', '-t', '8000', title,
+                      'Откройте окно таймера: завершить или отложить напоминание'],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return launch_window(True, state['id'])
+
+
+def toggle():
+    ensure_daemon()
+    runtime = paths()['runtime']
+    fd = os.open(runtime / 'window.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w') as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        monitor = next(m for m in json.loads(hypr('-j', 'monitors')) if m.get('focused'))
+        if monitor.get('specialWorkspace', {}).get('name') == 'special:calendar':
+            hypr('dispatch', 'hl.dsp.workspace.toggle_special("calendar")')
+            return
+        if not any(w.get('class') == 'calendar-popup' for w in json.loads(hypr('-j', 'clients'))):
+            launch_window()
+        place_window()
+
+
+class Panel:
+    def __init__(self, screen, *, scratchpad=False, alarm_id=''):
+        self.screen, self.scratchpad, self.alarm_id = screen, scratchpad, alarm_id
+        self.agenda = None if alarm_id else Agenda(paths()['agenda'])
+        self.timer = ensure_daemon()
+        self.tab = 0
+        self.selected = date.today()
+        self.year_view = False
+        self.preview_focus = False
+        self.task_index = 0
+        self.buttons = []
+        self.form = None
+        self.text, self.cursor = '', 0
+        self.message = '' if alarm_id else 'A — добавить задачу · N — важная дата · Enter — отметить задачу'
+        self.stopped = False
+        self.dirty = True
+        self.last_second = None
+        self.agenda_error = ''
+
+    def put(self, y, x, text, color=0, width=None):
+        height, columns = self.screen.getmaxyx()
+        if not (0 <= y < height and 0 <= x < columns - 1):
+            return
+        try:
+            self.screen.addstr(y, x, fit(text, min(width if width is not None else columns - x - 1, columns - x - 1)), color)
+        except curses.error:
+            pass
+
+    def button(self, row, column, text, action):
+        self.put(row, column, text, curses.color_pair(4), len(text))
+        self.buttons.append((row, column, column + len(text), action))
+
+    def day(self):
+        return date.today() if self.tab == 0 else self.selected
+
+    def open_form(self, kind, prompt, default='', callback=None):
+        self.form = {'kind': kind, 'prompt': prompt, 'default': default, 'callback': callback, 'day': self.day()}
+        self.text, self.cursor = '', 0
+
+    def confirm(self, prompt, callback):
+        self.open_form('confirm', prompt + ' [y/n]', callback=callback)
+
+    def timer_start(self, mode, seconds=1500):
+        def start():
+            self.timer = request('start', mode=mode, seconds=seconds)
+            self.message = 'Таймер запущен' if mode == 'timer' else 'Pomodoro запущен'
+        if self.timer['status'] != 'idle':
+            self.confirm('Заменить текущий таймер?', start)
+        else:
+            start()
+
+    def submit(self):
+        form = self.form
+        text = self.text.strip() or form['default']
+        kind = form['kind']
+        self.form = None
+        try:
+            if kind == 'confirm':
+                if text.lower() in ('y', 'да', 'д'):
+                    form['callback']()
+                else:
+                    self.message = 'Отменено'
+            elif kind == 'task':
+                self.agenda.add(form['day'], text)
+                self.message = 'Задача добавлена'
+            elif kind == 'event':
+                annual = text.startswith('*')
+                self.agenda.add(form['day'], text.lstrip('*').strip(), event=True, annual=annual)
+                self.message = 'Важная дата добавлена'
+            elif kind == 'timer':
+                self.timer_start('timer', duration(text))
+            elif kind == 'settings':
+                values = text.replace(',', '.').split()
+                if len(values) != 4:
+                    raise ValueError('Введите: работа, короткий перерыв, длинный перерыв (минуты), число интервалов')
+                work, short, long = [duration(v) for v in values[:3]]
+                self.timer = request('settings', work=work, short=short, long=long, rounds=int(values[3]))
+                self.message = 'Настройки Pomodoro сохранены'
+            elif kind == 'snooze':
+                self.timer = request('snooze', id=self.alarm_id, seconds=duration(text))
+                self.stopped = True
+        except (ValueError, OSError, RuntimeError) as error:
+            self.form = form
+            self.message = clean(error)
+
+    def edit(self, key):
+        if key == 27:
+            self.form = None
+            self.message = 'Ввод отменён'
+        elif key in (10, 13, curses.KEY_ENTER):
+            self.submit()
+        elif self.form['kind'] == 'confirm' and isinstance(key, str) and key.lower() in ('y', 'n', 'д', 'н'):
+            self.text = key
+            self.submit()
+        elif key in (curses.KEY_BACKSPACE, 127, 8):
+            if self.cursor:
+                self.text = self.text[:self.cursor - 1] + self.text[self.cursor:]
+                self.cursor -= 1
+        elif key == curses.KEY_DC:
+            self.text = self.text[:self.cursor] + self.text[self.cursor + 1:]
+        elif key == curses.KEY_LEFT:
+            self.cursor = max(0, self.cursor - 1)
+        elif key == curses.KEY_RIGHT:
+            self.cursor = min(len(self.text), self.cursor + 1)
+        elif key == curses.KEY_HOME:
+            self.cursor = 0
+        elif key == curses.KEY_END:
+            self.cursor = len(self.text)
+        elif key == 21:
+            self.text, self.cursor = '', 0
+        elif isinstance(key, str) and key.isprintable() and len(self.text) < 2000:
+            self.text = self.text[:self.cursor] + key + self.text[self.cursor:]
+            self.cursor += len(key)
+
+    def toggle_task(self, delete=False):
+        tasks = self.agenda.tasks(self.day())
+        if not tasks:
+            return
+        self.task_index = min(self.task_index, len(tasks) - 1)
+        if delete:
+            self.confirm('Удалить выбранную задачу?', lambda: self.agenda.change(self.day(), self.task_index, delete=True))
+        else:
+            self.agenda.change(self.day(), self.task_index)
+
+    def change_tab(self, tab):
+        self.tab = tab % 3
+        self.task_index, self.preview_focus = 0, False
+        self.message = ''
+
+    def handle(self, key):
+        if key == curses.KEY_MOUSE:
+            if self.form:
+                return
+            try:
+                _, x, y, _, flags = curses.getmouse()
+            except curses.error:
+                return
+            if not flags & (curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED):
+                return
+            action = next((b[3] for b in self.buttons if b[0] == y and b[1] <= x < b[2]), None)
+            if isinstance(action, tuple):
+                kind, value = action
+                if kind == 'tab':
+                    self.change_tab(value)
+                elif kind == 'day':
+                    self.selected, self.task_index, self.preview_focus = value, 0, False
+                elif kind == 'task':
+                    self.task_index = value
+                    self.toggle_task()
+                return
+            if action is None:
+                return
+            key = action
+        if self.form:
+            self.edit(key)
+            return
+        if self.alarm_id:
+            if key in (27, 'q', 'd'):
+                request('stop', id=self.alarm_id)
+                self.stopped = True
+            elif key in (10, 13, curses.KEY_ENTER):
+                request('dismiss', id=self.alarm_id)
+                self.stopped = True
+            elif key == 's':
+                request('snooze', id=self.alarm_id, seconds=300)
+                self.stopped = True
+            elif key == 'n':
+                self.open_form('snooze', 'Отложить: минуты / 90s / MM:SS', '5')
+            return
+        if key in ('1', '2', '3'):
+            self.change_tab(int(key) - 1)
+        elif key in (9, curses.KEY_BTAB):
+            self.change_tab(self.tab + (1 if key == 9 else -1))
+        elif key in (27, 'q'):
+            if self.preview_focus:
+                self.preview_focus = False
+            elif self.scratchpad:
+                hypr('dispatch', 'hl.dsp.workspace.toggle_special("calendar")')
+            else:
+                self.stopped = True
+        elif self.tab in (0, 1) and key == 'a':
+            self.open_form('task', 'Задача на ' + self.day().isoformat())
+        elif self.tab in (0, 1) and key == 'n':
+            self.open_form('event', 'Важная дата на ' + self.day().isoformat() + ' · *текст — ежегодно')
+        elif self.tab == 2:
+            if key == 'n':
+                self.open_form('timer', 'Таймер: минуты / 1h30m / MM:SS / HH:MM:SS', '5')
+            elif key == 'm':
+                self.timer_start('pomodoro')
+            elif key == ' ':
+                action = 'pause' if self.timer['status'] == 'running' else 'resume'
+                self.timer = request(action)
+            elif key == 'd':
+                self.timer = request('stop')
+            elif key == 'e':
+                s = self.timer['settings']
+                self.open_form('settings', 'Pomodoro: работа / короткий / длинный (мин) / интервалы', f"{s['work']/60:g} {s['short']/60:g} {s['long']/60:g} {s['rounds']}")
+        elif self.tab == 0 or self.preview_focus:
+            tasks = self.agenda.tasks(self.day())
+            if key in (curses.KEY_UP, 'k'):
+                self.task_index = max(0, self.task_index - 1)
+            elif key in (curses.KEY_DOWN, 'j'):
+                self.task_index = min(max(0, len(tasks) - 1), self.task_index + 1)
+            elif key in (10, 13, curses.KEY_ENTER, ' '):
+                self.toggle_task()
+            elif key == 'd':
+                self.toggle_task(True)
+        elif self.tab == 1:
+            movement = {curses.KEY_LEFT: -1, curses.KEY_RIGHT: 1, curses.KEY_UP: -7, curses.KEY_DOWN: 7, 'h': -1, 'l': 1, 'k': -7, 'j': 7}
+            if key in movement:
+                self.selected += timedelta(days=movement[key])
+                self.task_index = 0
+            elif key in (curses.KEY_PPAGE, curses.KEY_NPAGE):
+                self.selected = shift_month(self.selected, (12 if self.year_view else 1) * (-1 if key == curses.KEY_PPAGE else 1))
+            elif key in (curses.KEY_HOME, 't'):
+                self.selected = date.today()
+            elif key == 'y':
+                self.year_view = not self.year_view
+            elif key in (10, 13, curses.KEY_ENTER):
+                self.preview_focus = True
+            elif key == 'd':
+                self.toggle_task(True)
+
+    def draw_tasks(self, day, y, x, width, rows, selected=False):
+        tasks = self.agenda.tasks(day)
+        if not tasks:
+            self.put(y, x, 'Нет задач · A — добавить', curses.color_pair(5), width)
+            return
+        self.task_index = min(self.task_index, len(tasks) - 1)
+        start = max(0, self.task_index - rows + 1) if selected else 0
+        for row, task in enumerate(tasks[start:start + rows], y):
+            index = start + row - y
+            attr = curses.color_pair(6) if selected and index == self.task_index else curses.color_pair(5 if task.get('done') else 0)
+            self.put(row, x, ('[x] ' if task.get('done') else '[ ] ') + task['text'], attr, width)
+            self.buttons.append((row, x, x + width, ('task', index)))
+
+    def draw_today(self, height, width):
+        today = date.today()
+        self.put(4, 2, today.strftime('%A, %d %B %Y'), curses.A_BOLD)
+        self.put(6, 2, datetime.now().strftime('%H:%M:%S'), curses.color_pair(4) | curses.A_BOLD)
+        split = max(34, width - 38)
+        self.put(9, 2, 'TODO НА СЕГОДНЯ', curses.A_BOLD)
+        self.draw_tasks(today, 11, 2, split - 4, max(1, height - 16), True)
+        self.put(4, split, 'ДАТЫ И СОБЫТИЯ', curses.color_pair(3) | curses.A_BOLD)
+        row = 6
+        for offset in range(8):
+            day = today + timedelta(days=offset)
+            for event in self.agenda.events(day):
+                self.put(row, split, ('Сегодня' if offset == 0 else day.strftime('%d.%m')) + ' · ' + event['text'], curses.color_pair(3), width - split - 2)
+                row += 1
+                if row >= height - 5:
+                    return
+        if row == 6:
+            self.put(row, split, 'На неделю важных дат нет', curses.color_pair(5))
+
+    def draw_month(self, year, month, y, x, cell=3, step=1):
+        self.put(y, x, f'{calendar.month_name[month]} {year}', curses.color_pair(4) | curses.A_BOLD, cell * 7)
+        for column, name in enumerate(WEEKDAYS):
+            self.put(y + 1, x + column * cell, name, curses.color_pair(5), cell)
+        for week, days in enumerate(calendar.monthcalendar(year, month)):
+            for column, number in enumerate(days):
+                if not number:
+                    continue
+                day = date(year, month, number)
+                marker = '!' if self.agenda.events(day) else '·' if self.agenda.tasks(day) else ' '
+                attr = curses.color_pair(6) if day == self.selected else curses.color_pair(3) if day == date.today() else 0
+                row, col = y + 2 + week * step, x + column * cell
+                self.put(row, col, f'{number:2}{marker}', attr, cell)
+                self.buttons.append((row, col, col + cell, ('day', day)))
+
+    def draw_calendar(self, height, width):
+        preview_width = min(38, max(28, width // 4))
+        split = width - preview_width - 2
+        self.put(3, 2, str(self.selected.year) if self.year_view else self.selected.strftime('%B %Y'), curses.A_BOLD)
+        self.button(3, 25, '[Y Month / Year]', 'y')
+        self.button(3, 45, '[T Today]', 't')
+        if self.year_view:
+            columns = max(1, min(4, (split - 2) // 23))
+            visible = max(1, (height - 10) // 9)
+            total = (12 + columns - 1) // columns
+            first = max(0, min((self.selected.month - 1) // columns - visible + 1, total - visible))
+            for index in range(first * columns, min(12, (first + visible) * columns)):
+                row, col = divmod(index, columns)
+                self.draw_month(self.selected.year, index + 1, 5 + (row - first) * 9, 2 + col * 23)
+        else:
+            cell = max(3, min(7, (split - 4) // 7))
+            self.draw_month(self.selected.year, self.selected.month, 6, 2, cell, 2)
+        for row in range(4, height - 4):
+            self.put(row, split, '│', curses.color_pair(5), 1)
+        x = split + 2
+        self.put(4, x, self.selected.strftime('%a, %d %b %Y'), curses.color_pair(4) | curses.A_BOLD, preview_width - 2)
+        row = 6
+        for event in self.agenda.events(self.selected):
+            for line in textwrap.wrap('! ' + event['text'], max(10, preview_width - 4)):
+                if row >= height - 8:
+                    break
+                self.put(row, x, line, curses.color_pair(3), preview_width - 3)
+                row += 1
+        self.put(row + 1, x, 'ЗАДАЧИ ДНЯ' + (' ◀' if self.preview_focus else ''), curses.A_BOLD, preview_width - 3)
+        self.draw_tasks(self.selected, row + 3, x, preview_width - 3, max(1, height - row - 8), self.preview_focus)
+        self.put(height - 4, 2, '· задачи  ! важная дата · ←↑↓→ дни · PgUp/Dn месяц/год · Enter задачи дня', curses.color_pair(5))
+
+    def draw_timer(self, height, width):
+        state = self.timer
+        self.put(4, 2, 'POMODORO' if state['mode'] == 'pomodoro' else 'ТАЙМЕР', curses.A_BOLD)
+        labels = {'idle': 'Не запущен', 'running': 'Идёт отсчёт', 'paused': 'Пауза', 'alarm': 'Время истекло'}
+        self.put(6, 2, PHASES[state['phase']] + ' · ' + labels[state['status']], curses.color_pair(3))
+        if state.get('snoozing'):
+            self.put(7, 2, 'Напоминание отложено', curses.color_pair(5))
+        self.put(9, 2, stamp(state['remaining']), curses.color_pair(4) | curses.A_BOLD)
+        size = min(65, width - 8)
+        completed = int(size * max(0, min(1, 1 - state['remaining'] / max(1, state['seconds']))))
+        self.put(11, 2, '━' * completed + '─' * (size - completed), curses.color_pair(4))
+        self.button(14, 2, '[N Timer]', 'n')
+        self.button(14, 17, '[M Pomodoro]', 'm')
+        self.button(14, 35, '[Space Pause / Resume]', ' ')
+        self.button(16, 2, '[D Stop]', 'd')
+        self.button(16, 17, '[E Settings]', 'e')
+        settings = state['settings']
+        self.put(19, 2, f"Работа {settings['work']/60:g} мин · перерыв {settings['short']/60:g} мин · длинный {settings['long']/60:g} мин после {settings['rounds']} интервалов")
+        if state['mode'] == 'pomodoro':
+            self.put(21, 2, f"Завершено рабочих интервалов: {state['completed']}", curses.color_pair(5))
+        self.put(height - 5, 2, 'Таймер продолжит работу, если скрыть или закрыть панель', curses.color_pair(5))
+
+    def draw_alarm(self, height, width):
+        state = self.timer
+        self.put(3, 3, 'ВРЕМЯ ИСТЕКЛО', curses.color_pair(3) | curses.A_BOLD)
+        self.put(5, 3, 'Pomodoro · ' + PHASES[state['phase']] if state['mode'] == 'pomodoro' else 'Таймер завершён', curses.A_BOLD)
+        self.put(7, 3, datetime.now().strftime('%H:%M:%S'), curses.color_pair(4))
+        self.button(10, 3, '[Enter Continue]' if state['mode'] == 'pomodoro' else '[Enter Dismiss]', 10)
+        self.button(12, 3, '[S Snooze 5 min]', 's')
+        self.button(12, 25, '[N Other delay]', 'n')
+        self.button(14, 3, '[D Stop]', 'd')
+        if state['mode'] == 'pomodoro':
+            self.put(16, 3, 'Enter — следующий интервал · D/Esc — завершить Pomodoro', curses.color_pair(5))
+
+    def draw(self):
+        # erase не посылает clear экрану: curses сравнит готовый кадр с предыдущим.
+        self.screen.erase()
+        height, width = self.screen.getmaxyx()
+        self.buttons = []
+        if self.alarm_id:
+            self.draw_alarm(height, width)
+        else:
+            for index, name in enumerate(('Today', 'Calendar', 'Timer')):
+                self.button(0, 2 + index * 17, f'[{index + 1} {name}]', ('tab', index))
+                if index == self.tab:
+                    self.put(0, 2 + index * 17, f'[{index + 1} {name}]', curses.color_pair(6), 15)
+            self.put(1, 2, datetime.now().strftime('%H:%M:%S   %d.%m.%Y'), curses.color_pair(5))
+            if height < 25 or width < 75:
+                self.put(5, 2, 'Увеличьте окно: нужно хотя бы 75×25 ячеек', curses.color_pair(3))
+            elif self.tab == 0:
+                self.draw_today(height, width)
+            elif self.tab == 1:
+                self.draw_calendar(height, width)
+            else:
+                self.draw_timer(height, width)
+        self.put(height - 3, 2, self.agenda_error or self.message, curses.color_pair(2 if self.agenda_error else 3))
+        self.put(height - 1, 2, 'Tab / 1–3 вкладки · A задача · N дата · D удалить · Esc скрыть' if not self.alarm_id and self.tab != 2 else 'Esc скрыть · N таймер · M Pomodoro · Space пауза · D стоп' if not self.alarm_id else 'Enter завершить / продолжить · S/N отложить · Esc выключить', curses.color_pair(5))
+        try:
+            curses.curs_set(1 if self.form else 0)
+        except curses.error:
+            pass
+        if self.form:
+            self.put(height - 4, 2, self.form['prompt'], curses.color_pair(4))
+            suffix = ' [Enter: ' + self.form['default'] + ']' if self.form['default'] else ''
+            self.put(height - 2, 2, '> ' + self.text + (suffix if not self.text else ''), curses.color_pair(4))
+            try:
+                self.screen.move(height - 2, min(width - 2, 4 + self.cursor))
+            except curses.error:
+                pass
+        self.screen.refresh()
+        self.dirty = False
+
+    def loop(self):
+        curses.use_default_colors()
+        for index, color in enumerate((curses.COLOR_GREEN, curses.COLOR_RED, curses.COLOR_YELLOW, curses.COLOR_MAGENTA, 8 if curses.COLORS >= 16 else curses.COLOR_WHITE), 1):
+            curses.init_pair(index, color, -1)
+        curses.init_pair(6, curses.COLOR_WHITE, curses.COLOR_BLUE)
+        curses.set_escdelay(30)
+        curses.mousemask(curses.ALL_MOUSE_EVENTS)
+        curses.mouseinterval(0)
+        self.screen.timeout(150)
+        self.screen.keypad(True)
+        while not self.stopped:
+            second = int(time.time())
+            if second != self.last_second:
+                try:
+                    self.timer = request()
+                    if self.agenda:
+                        self.agenda.reload()
+                        self.agenda_error = ''
+                except (OSError, ValueError) as error:
+                    self.agenda_error = clean(error)
+                self.last_second, self.dirty = second, True
+            if self.alarm_id and (self.timer['status'] != 'alarm' or self.timer['id'] != self.alarm_id):
+                break
+            if self.dirty:
+                self.draw()
+            try:
+                key = self.screen.get_wch()
+            except curses.error:
+                continue
+            if key == curses.KEY_RESIZE:
+                self.dirty = True
+                continue
+            if isinstance(key, str) and len(key) == 1 and ord(key) < 32:
+                key = ord(key)
+            try:
+                self.handle(key)
+            except (OSError, ValueError, RuntimeError, IndexError, OverflowError) as error:
+                self.message = clean(error)
+            self.dirty = True
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument('--tui', action='store_true', help='Открыть в текущем терминале')
+    group.add_argument('--daemon', action='store_true', help='Фоновый процесс таймера')
+    group.add_argument('--alarm', metavar='ID', help=argparse.SUPPRESS)
+    parser.add_argument('--scratchpad', action='store_true', help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    if args.daemon:
+        serve(alarm_callback)
+    elif args.tui or args.alarm:
+        locale.setlocale(locale.LC_ALL, '')
+        def tui(screen):
+            panel = Panel(screen, scratchpad=args.scratchpad, alarm_id=args.alarm or '')
+            for sig in (signal.SIGTERM, signal.SIGHUP):
+                signal.signal(sig, lambda *_: setattr(panel, 'stopped', True))
+            if args.alarm:
+                place_window(True)
+            try:
+                panel.loop()
+            finally:
+                if args.alarm:
+                    current = request()
+                    if current['status'] == 'alarm' and current['id'] == args.alarm:
+                        request('stop', id=args.alarm)
+        curses.wrapper(tui)
+    else:
+        toggle()
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
+    except (OSError, ValueError, RuntimeError, StopIteration, curses.error) as error:
+        print('calendar-popup: ' + clean(error), file=sys.stderr)
+        if '--daemon' not in sys.argv and '--tui' not in sys.argv:
+            subprocess.run(['notify-send', '-u', 'critical', 'Calendar', clean(error)], check=False)
+        sys.exit(1)

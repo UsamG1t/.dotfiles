@@ -23,6 +23,7 @@ HYPRLAND_SCRIPTS = (
 )
 HYPRLAND_IGNORES = (
     r"(^|/)\.config/(hypr|hyprland|waybar)$",
+    r"(^|/)\.local/lib/calendar_panel$",
     r"(^|/)\.local/bin/(" + "|".join(HYPRLAND_SCRIPTS) + r")$",
 )
 

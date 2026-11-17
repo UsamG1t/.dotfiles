@@ -81,9 +81,19 @@ center = true,
 hl.window_rule({
 name  = "calendar-popup",
 match = { class = "calendar-popup" },
+workspace = "special:calendar silent",
 float = true,
-size  = "250 300",
-move  = "835 35",
+size  = "60% 65%",
+move  = "monitor_w-window_w-12 40",
+})
+
+hl.window_rule({
+    name = "calendar-alarm",
+    match = { class = "calendar-alarm" },
+    workspace = "special:calendar-alarm silent",
+    float = true,
+    size = "55% 40%",
+    center = true,
 })
  
 -- Попап управления сетью (клик по network в waybar)

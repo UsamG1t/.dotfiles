@@ -84,6 +84,8 @@ class Agenda:
                     date.fromisoformat(item['date'])
                     if group == 'tasks' and not isinstance(item.get('done', False), bool):
                         raise ValueError('done должен быть true/false')
+                    if group == 'tasks' and not isinstance(item.get('pinned', False), bool):
+                        raise ValueError('pinned должен быть true/false')
                     if group == 'dates' and not isinstance(item.get('annual', False), bool):
                         raise ValueError('annual должен быть true/false')
         except (ValueError, KeyError, TypeError) as error:
@@ -91,7 +93,13 @@ class Agenda:
         self.data = data
 
     def tasks(self, day):
-        return [item for item in self.data['tasks'] if item['date'] == day.isoformat()]
+        return [item for item in self.data['tasks'] if item['date'] == day.isoformat() and not item.get('pinned', False)]
+
+    def pinned_tasks(self):
+        return [item for item in self.data['tasks'] if item.get('pinned', False)]
+
+    def visible_tasks(self, day):
+        return self.pinned_tasks() + self.tasks(day)
 
     def events(self, day):
         return [item for item in self.data['dates'] if (item['date'][5:] == day.isoformat()[5:] if item.get('annual') else item['date'] == day.isoformat())]
@@ -106,9 +114,8 @@ class Agenda:
             self.data['dates' if event else 'tasks'].append(item)
             atomic_json(self.path, self.data)
 
-    def change(self, day, index, delete=False):
+    def change(self, selected, delete=False, pin=False):
         # Повторно читаем файл под блокировкой, чтобы сохранить сторонние добавления.
-        selected = self.tasks(day)[index]
         with self.lock():
             self.reload()
             item = next((t for t in self.data['tasks'] if (t.get('id') == selected['id'] if selected.get('id') else t == selected)), None)
@@ -116,9 +123,12 @@ class Agenda:
                 raise ValueError('Задача уже изменена; обновите список')
             if delete:
                 self.data['tasks'].remove(item)
+            elif pin:
+                item['pinned'] = not item.get('pinned', False)
             else:
                 item['done'] = not item.get('done', False)
             atomic_json(self.path, self.data)
+            return item
 
 
 def duration(text):

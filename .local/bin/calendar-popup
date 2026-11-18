@@ -275,15 +275,25 @@ class Panel:
             self.text = self.text[:self.cursor] + key + self.text[self.cursor:]
             self.cursor += len(key)
 
-    def toggle_task(self, delete=False):
-        tasks = self.agenda.tasks(self.day())
+    def toggle_task(self, delete=False, pin=False):
+        tasks = self.agenda.visible_tasks(self.day())
         if not tasks:
             return
         self.task_index = min(self.task_index, len(tasks) - 1)
+        selected = tasks[self.task_index].copy()
+
+        def change():
+            updated = self.agenda.change(selected, delete=delete, pin=pin)
+            visible = self.agenda.visible_tasks(self.day())
+            self.task_index = next((i for i, task in enumerate(visible) if task is updated),
+                                   max(0, min(self.task_index, len(visible) - 1)))
+            if pin:
+                self.message = 'Задача закреплена' if updated['pinned'] else 'Закрепление снято · исходная дата: ' + date.fromisoformat(updated['date']).strftime('%d.%m.%Y')
+
         if delete:
-            self.confirm('Удалить выбранную задачу?', lambda: self.agenda.change(self.day(), self.task_index, delete=True))
+            self.confirm('Удалить выбранную задачу?', change)
         else:
-            self.agenda.change(self.day(), self.task_index)
+            change()
 
     def change_tab(self, tab):
         self.tab = tab % 3
@@ -309,6 +319,7 @@ class Panel:
                     self.selected, self.task_index, self.preview_focus = value, 0, False
                 elif kind == 'task':
                     self.task_index = value
+                    self.preview_focus = self.tab == 1
                     self.toggle_task()
                 return
             if action is None:
@@ -345,6 +356,9 @@ class Panel:
             self.open_form('task', 'Задача на ' + self.day().isoformat())
         elif self.tab in (0, 1) and key == 'n':
             self.open_form('event', 'Важная дата на ' + self.day().isoformat() + ' · *текст — ежегодно')
+        elif self.tab in (0, 1) and key in ('p', 'P'):
+            self.preview_focus = self.tab == 1
+            self.toggle_task(pin=True)
         elif self.tab == 2:
             if not self.timer_enabled:
                 self.message = 'Таймер отключён в консольном режиме'
@@ -362,7 +376,7 @@ class Panel:
                 s = self.timer['settings']
                 self.open_form('settings', 'Pomodoro: работа / короткий / длинный (мин) / интервалы', f"{s['work']/60:g} {s['short']/60:g} {s['long']/60:g} {s['rounds']}")
         elif self.tab == 0 or self.preview_focus:
-            tasks = self.agenda.tasks(self.day())
+            tasks = self.agenda.visible_tasks(self.day())
             if key in (curses.KEY_UP, 'k'):
                 self.task_index = max(0, self.task_index - 1)
             elif key in (curses.KEY_DOWN, 'j'):
@@ -387,37 +401,53 @@ class Panel:
             elif key == 'd':
                 self.toggle_task(True)
 
-    def draw_tasks(self, day, y, x, width, rows, selected=False):
-        tasks = self.agenda.tasks(day)
+    def draw_tasks(self, tasks, y, x, width, rows, selected=False, offset=0, empty='Нет задач · A — добавить'):
         if not tasks:
-            self.put(y, x, 'Нет задач · A — добавить', curses.color_pair(5), width)
+            self.put(y, x, empty, curses.color_pair(5), width)
             return
-        self.task_index = min(self.task_index, len(tasks) - 1)
-        start = max(0, self.task_index - rows + 1) if selected else 0
+        local_index = self.task_index - offset
+        start = max(0, local_index - rows + 1) if selected and 0 <= local_index < len(tasks) else 0
         for row, task in enumerate(tasks[start:start + rows], y):
-            index = start + row - y
+            index = offset + start + row - y
             attr = curses.color_pair(6) if selected and index == self.task_index else curses.color_pair(5 if task.get('done') else 0)
             self.put(row, x, ('[x] ' if task.get('done') else '[ ] ') + task['text'], attr, width)
             self.buttons.append((row, x, x + width, ('task', index)))
 
+    def draw_task_panel(self, day, y, x, width, rows, selected=False):
+        pinned, daily = self.agenda.pinned_tasks(), self.agenda.tasks(day)
+        self.task_index = max(0, min(self.task_index, len(pinned) + len(daily) - 1))
+        if pinned or daily:
+            task = (pinned + daily)[self.task_index]
+            self.button(y, x, '[P Unpin]' if task.get('pinned') else '[P Pin]', 'p')
+        pinned_rows = max(1, (rows - 4) // 2)
+        daily_rows = max(1, rows - 4 - pinned_rows)
+        pinned_focus = selected and self.task_index < len(pinned)
+        self.put(y + 1, x, 'ЗАКРЕПЛЁННЫЕ ЗАДАЧИ' + (' ◀' if pinned_focus else ''), curses.A_BOLD, width)
+        self.draw_tasks(pinned, y + 2, x, width, pinned_rows, selected, empty='Нет закреплённых задач')
+        daily_y = y + 3 + pinned_rows
+        self.put(daily_y, x, 'ЗАДАЧИ НА ' + day.strftime('%d.%m.%Y') + (' ◀' if selected and not pinned_focus else ''), curses.A_BOLD, width)
+        self.draw_tasks(daily, daily_y + 1, x, width, daily_rows, selected, offset=len(pinned))
+
     def draw_today(self, height, width):
         today = date.today()
-        self.put(4, 2, today.strftime('%A, %d %B %Y'), curses.A_BOLD)
-        self.put(6, 2, datetime.now().strftime('%H:%M:%S'), curses.color_pair(4) | curses.A_BOLD)
-        split = max(34, width - 38)
-        self.put(9, 2, 'TODO НА СЕГОДНЯ', curses.A_BOLD)
-        self.draw_tasks(today, 11, 2, split - 4, max(1, height - 16), True)
-        self.put(4, split, 'ДАТЫ И СОБЫТИЯ', curses.color_pair(3) | curses.A_BOLD)
-        row = 6
+        preview_width = min(42, max(30, width // 3))
+        split = width - preview_width - 2
+        self.put(4, 2, today.strftime('%A, %d %B %Y'), curses.A_BOLD, split - 4)
+        self.put(6, 2, datetime.now().strftime('%H:%M:%S'), curses.color_pair(4) | curses.A_BOLD, split - 4)
+        for row in range(4, height - 4):
+            self.put(row, split, '│', curses.color_pair(5), 1)
+        self.draw_task_panel(today, 4, split + 2, preview_width - 3, height - 9, True)
+        self.put(9, 2, 'ДАТЫ И СОБЫТИЯ', curses.color_pair(3) | curses.A_BOLD, split - 4)
+        row = 11
         for offset in range(8):
             day = today + timedelta(days=offset)
             for event in self.agenda.events(day):
-                self.put(row, split, ('Сегодня' if offset == 0 else day.strftime('%d.%m')) + ' · ' + event['text'], curses.color_pair(3), width - split - 2)
+                self.put(row, 2, ('Сегодня' if offset == 0 else day.strftime('%d.%m')) + ' · ' + event['text'], curses.color_pair(3), split - 4)
                 row += 1
                 if row >= height - 5:
                     return
-        if row == 6:
-            self.put(row, split, 'На неделю важных дат нет', curses.color_pair(5))
+        if row == 11:
+            self.put(row, 2, 'На неделю важных дат нет', curses.color_pair(5), split - 4)
 
     def draw_month(self, year, month, y, x, cell=3, step=1):
         self.put(y, x, f'{calendar.month_name[month]} {year}', curses.color_pair(4) | curses.A_BOLD, cell * 7)
@@ -455,16 +485,16 @@ class Panel:
             self.put(row, split, '│', curses.color_pair(5), 1)
         x = split + 2
         self.put(4, x, self.selected.strftime('%a, %d %b %Y'), curses.color_pair(4) | curses.A_BOLD, preview_width - 2)
-        row = 6
-        for event in self.agenda.events(self.selected):
-            for line in textwrap.wrap('! ' + event['text'], max(10, preview_width - 4)):
-                if row >= height - 8:
-                    break
-                self.put(row, x, line, curses.color_pair(3), preview_width - 3)
-                row += 1
-        self.put(row + 1, x, 'ЗАДАЧИ ДНЯ' + (' ◀' if self.preview_focus else ''), curses.A_BOLD, preview_width - 3)
-        self.draw_tasks(self.selected, row + 3, x, preview_width - 3, max(1, height - row - 8), self.preview_focus)
-        self.put(height - 4, 2, '· задачи  ! важная дата · ←↑↓→ дни · PgUp/Dn месяц/год · Enter задачи дня', curses.color_pair(5))
+        event_lines = [line for event in self.agenda.events(self.selected)
+                       for line in textwrap.wrap('! ' + event['text'], max(10, preview_width - 4))]
+        event_rows = min(len(event_lines), max(0, min(5, height - 20)))
+        for index, line in enumerate(event_lines[:event_rows]):
+            if index == event_rows - 1 and len(event_lines) > event_rows:
+                line = '… ещё строки событий: ' + str(len(event_lines) - index)
+            self.put(6 + index, x, line, curses.color_pair(3), preview_width - 3)
+        task_y = 7 + event_rows
+        self.draw_task_panel(self.selected, task_y, x, preview_width - 3, height - 5 - task_y, self.preview_focus)
+        self.put(height - 4, 2, '· задачи  ! дата · ←↑↓→ дни · PgUp/Dn месяц/год · Enter список · P pin', curses.color_pair(5))
 
     def draw_timer(self, height, width):
         if not self.timer_enabled:
@@ -529,7 +559,7 @@ class Panel:
         if self.alarm_id:
             hints = 'Enter завершить / продолжить · S/N отложить · Esc выключить'
         elif self.tab != 2:
-            hints = 'Tab / 1–3 вкладки · A задача · N дата · D удалить · Esc скрыть'
+            hints = 'Tab / 1–3 вкладки · A задача · N дата · P pin · D удалить · Esc скрыть'
         elif self.timer_enabled:
             hints = 'Esc скрыть · N таймер · M Pomodoro · Space пауза · D стоп'
         else:

@@ -18,6 +18,9 @@ import time
 import unicodedata
 from urllib.parse import urlsplit
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'lib'))
+from gui_mode import console_mode
+from panel_privileges import process_prompt, run_privileged
 
 WINDOW_CLASS = "tailscale-popup"
 WORKSPACE = "special:tailscale"
@@ -145,9 +148,9 @@ def control(arguments):
     result = run(command, timeout=30)
     message = clean(result.stderr or result.stdout)
     if result.returncode and any(s in message.lower() for s in ("access denied", "permission denied", "must be root")):
-        if not shutil.which("pkexec"):
+        if not console_mode() and not shutil.which("pkexec"):
             raise RuntimeError("Недостаточно прав; для графического запроса нужен polkit (pkexec)")
-        result = run(["pkexec", *command], timeout=120)
+        result = run_privileged(command)
         message = clean(result.stderr or result.stdout)
     if result.returncode:
         raise RuntimeError(message or "Команда не выполнена")
@@ -156,7 +159,7 @@ def control(arguments):
 
 def connect(status):
     if status.get("BackendState") == "Unavailable":
-        result = run(["pkexec", "systemctl", "start", "tailscaled.service"], timeout=120)
+        result = run_privileged(["/usr/bin/systemctl", "start", "tailscaled.service"])
         if result.returncode:
             raise RuntimeError(clean(result.stderr) or "Не удалось запустить tailscaled")
     # Без флагов up сохраняет существующие настройки DNS, маршрутов и exit-node.
@@ -337,7 +340,7 @@ class Panel:
         self.put(1, 1, f"Это устройство: {node_name(own)}  ·  {node_ip(own) or '—'}")
         self.put(2, 1, f"Exit-node: {exit_name(self.status)}", curses.color_pair(4))
         if self.status.get("AuthURL"):
-            self.button(3, 1, "[L Login in browser]", "l")
+            self.button(3, 1, "[L Login URL]" if console_mode() else "[L Login in browser]", "l")
         self.button(4, 1, "[A Ping all]", "a")
         self.button(4, 15, "[R Refresh]", "r")
         self.button(4, 29, "[E Exit node]", "e")
@@ -394,7 +397,8 @@ class Panel:
         health = self.status.get("Health") or []
         self.put(height - 3, 1, self.status.get("_error") or (clean(health[0]) if health else "Онлайн — статус сервера управления; ping — проверка пути Tailscale, не ICMP"), curses.color_pair(3))
         self.put(height - 2, 1, self.message, curses.color_pair(3) if self.busy else 0)
-        self.put(height - 1, 1, "↑↓/jk выбор · Enter/p ping · y копировать IP · e exit · r обновить · Esc/q " + ("скрыть" if self.scratchpad else "закрыть"), curses.color_pair(5))
+        ip_action = "y показать IP" if console_mode() else "y копировать IP"
+        self.put(height - 1, 1, "↑↓/jk выбор · Enter/p ping · " + ip_action + " · e exit · r обновить · Esc/q " + ("скрыть" if self.scratchpad else "закрыть"), curses.color_pair(5))
         self.screen.refresh()
 
     def handle(self, key):
@@ -471,12 +475,18 @@ class Panel:
             url = self.status.get("AuthURL", "")
             parsed = urlsplit(url)
             if parsed.scheme == "https" and parsed.hostname:
-                self.action(lambda: subprocess.run(["xdg-open", url], check=True, timeout=8, capture_output=True) and "Открыта страница входа")
+                if console_mode():
+                    self.message = "Вход: " + clean(url)
+                else:
+                    self.action(lambda: subprocess.run(["xdg-open", url], check=True, timeout=8, capture_output=True) and "Открыта страница входа")
             else:
                 self.message = "Для получения ссылки входа нажмите c (Connect)"
         elif key == ord("y") and nodes:
             address = node_ip(nodes[self.selected])
             if address:
+                if console_mode():
+                    self.message = "IP: " + address
+                    return True
                 def copy_ip():
                     subprocess.run(["wl-copy", "--", address], check=True, timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
                     return "IP скопирован: " + address
@@ -500,6 +510,7 @@ class Panel:
         self.screen.keypad(True)
         try:
             while True:
+                process_prompt(self.screen)
                 self.receive()
                 if time.monotonic() >= self.next_refresh and not self.refreshing:
                     self.refreshing = True
@@ -537,6 +548,6 @@ if __name__ == "__main__":
     except (OSError, ValueError, RuntimeError, StopIteration, curses.error, subprocess.SubprocessError) as error:
         message = clean(error) or "Не удалось открыть панель Tailscale"
         print("tailscale-panel: " + message, file=sys.stderr)
-        if "--waybar" not in sys.argv and "--tui" not in sys.argv and shutil.which("notify-send"):
+        if "--waybar" not in sys.argv and "--tui" not in sys.argv and not console_mode() and shutil.which("notify-send"):
             subprocess.run(["notify-send", "-u", "critical", "Tailscale", message], check=False)
         sys.exit(1)

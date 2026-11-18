@@ -1,0 +1,43 @@
+#!/usr/bin/env python3
+"""Картинки в Kitty, текстовый Ам Ням в остальных терминалах."""
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'lib'))
+from gui_mode import console_mode
+
+
+def main():
+    config = Path(os.environ.get('XDG_CONFIG_HOME', str(Path.home() / '.config'))) / 'fastfetch'
+    args = sys.argv[1:]
+    # Явный выбор пользователя, справка и служебные команды передаются без изменений.
+    explicit = ('--logo', '--logo-type', '--file', '--file-raw', '-l',
+                '--help', '-h', '--version', '-v', '--list-', '--gen-config')
+    if any(arg.split('=')[0] in explicit or arg.startswith(('--list-', '--gen-config')) for arg in args):
+        os.execv('/usr/bin/fastfetch', ['fastfetch', *args])
+    plain_output = False
+    for index, arg in enumerate(args):
+        if arg == '--pipe' or arg.startswith('--pipe='):
+            value = arg.partition('=')[2]
+            if not value and index + 1 < len(args) and not args[index + 1].startswith('-'):
+                value = args[index + 1]
+            plain_output = value.lower() != 'false'
+    kitty = (not plain_output and sys.stdout.isatty() and os.environ.get('KITTY_WINDOW_ID')
+             and not console_mode()
+             and not os.environ.get('TMUX') and not os.environ.get('STY'))
+    logo = ['--file', str(config / 'omnom.txt')]
+    if kitty:
+        result = subprocess.run([str(config / 'next-logo')], capture_output=True, text=True)
+        if result.returncode == 0 and result.stdout.strip():
+            # NO_COLOR не должен превращать графический терминал в консоль:
+            # Fastfetch иначе включает pipe-mode и отвергает изображения.
+            logo = ['--pipe', 'false', '--logo-type', 'kitty', '--logo', result.stdout.strip(), '--logo-width', '32']
+        else:
+            print(result.stderr.strip() or 'fastfetch: не удалось выбрать PNG', file=sys.stderr)
+    os.execv('/usr/bin/fastfetch', ['fastfetch', *logo, *args])
+
+
+if __name__ == '__main__':
+    main()

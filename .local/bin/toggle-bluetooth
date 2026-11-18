@@ -23,6 +23,9 @@ import termios
 import time
 import unicodedata
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'lib'))
+from gui_mode import console_mode
+from panel_privileges import process_prompt, run_privileged
 
 WINDOW_CLASS = "bluetooth-popup"
 WORKSPACE = "special:bluetooth"
@@ -100,9 +103,9 @@ def system_control(command):
     error = clean(result.stderr or result.stdout)
     denied = ("permission denied", "access denied", "authentication is required", "authentication required", "not authorized", "not permitted")
     if result.returncode and any(text in error.lower() for text in denied):
-        if not shutil.which("pkexec"):
+        if not console_mode() and not shutil.which("pkexec"):
             raise RuntimeError("Для запроса прав администратора нужен polkit (pkexec)")
-        result = subprocess.run(["pkexec", *command], capture_output=True, text=True, timeout=120)
+        result = run_privileged(command)
         error = clean(result.stderr or result.stdout)
     if result.returncode:
         raise RuntimeError(error or "Команда не выполнена")
@@ -849,6 +852,7 @@ class Panel:
         self.screen.keypad(True)
         try:
             while not self.stopped:
+                process_prompt(self.screen)
                 if self.session:
                     self.session.poll()
                     if self.session.process.poll() is not None:
@@ -910,6 +914,6 @@ if __name__ == "__main__":
     except (OSError, ValueError, RuntimeError, StopIteration, curses.error, subprocess.SubprocessError) as error:
         message = clean(error) or "Не удалось открыть Bluetooth-панель"
         print("toggle-bluetooth: " + message, file=sys.stderr)
-        if "--tui" not in sys.argv and shutil.which("notify-send"):
+        if "--tui" not in sys.argv and not console_mode() and shutil.which("notify-send"):
             subprocess.run(["notify-send", "-u", "critical", "Bluetooth", message], check=False)
         sys.exit(1)

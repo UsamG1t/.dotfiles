@@ -8,7 +8,10 @@ import math
 import os
 from pathlib import Path
 import re
+import select
+import signal
 import socket
+import struct
 import tempfile
 import time
 import uuid
@@ -202,6 +205,8 @@ class Timer:
         elif action == 'pause':
             if self.state['status'] == 'running':
                 self.state.update(remaining=self.remaining(), status='paused')
+            elif self.state['status'] == 'alarm':
+                self.state.update(remaining=0, status='paused')
         elif action == 'resume':
             if self.state['status'] == 'paused':
                 self.schedule(self.state['remaining'], self.state.get('snoozing', False))
@@ -234,10 +239,12 @@ class Timer:
         return self.snapshot()
 
 
-def request(action='status', **args):
+def request(action='status', _peer=False, **args):
     with socket.socket(socket.AF_UNIX) as client:
         client.settimeout(1.5)
         client.connect(str(paths()['runtime'] / 'control.sock'))
+        if _peer:
+            peer = struct.unpack('3i', client.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i')))
         client.sendall((json.dumps({'action': action, **args}) + '\n').encode())
         data = b''
         while not data.endswith(b'\n') and len(data) < 65536:
@@ -248,7 +255,7 @@ def request(action='status', **args):
     response = json.loads(data)
     if 'error' in response:
         raise ValueError(response['error'])
-    return response['state']
+    return (response['state'], peer) if _peer else response['state']
 
 
 def serve(alarm_callback):
@@ -291,6 +298,7 @@ def serve(alarm_callback):
                         continue
                     with client:
                         client.settimeout(.5)
+                        shutdown = False
                         try:
                             data = b''
                             while b'\n' not in data and len(data) <= 8192:
@@ -305,12 +313,62 @@ def serve(alarm_callback):
                                 raise ValueError('Запрос должен быть объектом')
                             action = args.pop('action')
                             timer.tick()
-                            response = {'state': timer.command(action, **args)}
+                            shutdown = action == 'shutdown'
+                            response = {'state': timer.command('pause' if shutdown else action, **args)}
                         except (ValueError, TypeError, KeyError, OSError) as error:
                             response = {'error': str(error)}
                         try:
                             client.sendall((json.dumps(response) + '\n').encode())
                         except OSError:
                             pass
+                        if shutdown and 'error' not in response:
+                            if alarm_process is not None and alarm_process.poll() is None:
+                                alarm_process.terminate()
+                            return
             finally:
                 address.unlink(missing_ok=True)
+
+
+def pause_and_stop():
+    """Остановить daemon с сохранением таймера; отсутствие daemon — штатный случай."""
+    try:
+        request('shutdown')
+        deadline = time.monotonic() + 5
+        while (paths()['runtime'] / 'control.sock').exists() and time.monotonic() < deadline:
+            time.sleep(.05)
+        if (paths()['runtime'] / 'control.sock').exists():
+            raise RuntimeError('Таймер не подтвердил остановку')
+        return
+    except (ConnectionRefusedError, FileNotFoundError):
+        pass
+    except ValueError as error:
+        if str(error) != 'Неизвестная команда':
+            raise
+        # Уже запущенная старая версия не знает shutdown. Сначала получает pause,
+        # затем завершается конкретный владелец сокета; посторонние Python не трогаем.
+        _, (pid, uid, _) = request('pause', _peer=True)
+        if uid != os.getuid() or pid == os.getpid():
+            raise RuntimeError('Неожиданный владелец сокета календаря')
+        descriptor = os.pidfd_open(pid)
+        try:
+            script = Path(__file__).resolve().parents[2] / 'bin/calendar-popup'
+            arguments = Path(f'/proc/{pid}/cmdline').read_bytes().split(b'\0')
+            if b'--daemon' not in arguments or not any(arg.endswith(b'/calendar-popup') and Path(os.fsdecode(arg)).resolve() == script for arg in arguments):
+                raise RuntimeError('Сокет принадлежит постороннему процессу')
+            signal.pidfd_send_signal(descriptor, signal.SIGTERM)
+            if not select.select([descriptor], [], [], 5)[0]:
+                raise RuntimeError('Старая версия таймера не завершилась')
+        finally:
+            os.close(descriptor)
+    # Файл мог остаться от завершившегося daemon. Не создаём пустой таймер.
+    runtime = paths()['runtime']
+    private_dir(runtime)
+    fd = os.open(runtime / 'daemon.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError('Таймер работает, но управляющий сокет недоступен')
+        (runtime / 'control.sock').unlink(missing_ok=True)
+        if paths()['timer'].exists():
+            Timer(paths()['timer']).command('pause')

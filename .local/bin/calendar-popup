@@ -18,7 +18,8 @@ import time
 import unicodedata
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'lib'))
-from calendar_panel import Agenda, duration, paths, private_dir, request, serve
+from calendar_panel import Agenda, Timer, duration, paths, pause_and_stop, private_dir, request, serve
+from gui_mode import console_mode
 
 
 SCRIPT = str(Path(__file__).resolve())
@@ -114,6 +115,8 @@ def place_window(alarm=False):
 
 
 def ensure_daemon():
+    if console_mode():
+        raise RuntimeError('Таймер доступен в графической сессии; в TTY работают Today и Calendar')
     try:
         return request()
     except (OSError, ValueError):
@@ -161,7 +164,8 @@ class Panel:
     def __init__(self, screen, *, scratchpad=False, alarm_id=''):
         self.screen, self.scratchpad, self.alarm_id = screen, scratchpad, alarm_id
         self.agenda = None if alarm_id else Agenda(paths()['agenda'])
-        self.timer = ensure_daemon()
+        self.timer_enabled = not console_mode()
+        self.timer = ensure_daemon() if self.timer_enabled else Timer(paths()['timer']).snapshot()
         self.tab = 0
         self.selected = date.today()
         self.year_view = False
@@ -342,6 +346,9 @@ class Panel:
         elif self.tab in (0, 1) and key == 'n':
             self.open_form('event', 'Важная дата на ' + self.day().isoformat() + ' · *текст — ежегодно')
         elif self.tab == 2:
+            if not self.timer_enabled:
+                self.message = 'Таймер отключён в консольном режиме'
+                return
             if key == 'n':
                 self.open_form('timer', 'Таймер: минуты / 1h30m / MM:SS / HH:MM:SS', '5')
             elif key == 'm':
@@ -460,6 +467,10 @@ class Panel:
         self.put(height - 4, 2, '· задачи  ! важная дата · ←↑↓→ дни · PgUp/Dn месяц/год · Enter задачи дня', curses.color_pair(5))
 
     def draw_timer(self, height, width):
+        if not self.timer_enabled:
+            self.put(5, 2, 'Таймер отключён в консольном режиме', curses.color_pair(3))
+            self.put(7, 2, 'После gui-off таймер остаётся на паузе. Возобновите его вручную в графической сессии.')
+            return
         state = self.timer
         self.put(4, 2, 'POMODORO' if state['mode'] == 'pomodoro' else 'ТАЙМЕР', curses.A_BOLD)
         labels = {'idle': 'Не запущен', 'running': 'Идёт отсчёт', 'paused': 'Пауза', 'alarm': 'Время истекло'}
@@ -515,7 +526,17 @@ class Panel:
             else:
                 self.draw_timer(height, width)
         self.put(height - 3, 2, self.agenda_error or self.message, curses.color_pair(2 if self.agenda_error else 3))
-        self.put(height - 1, 2, 'Tab / 1–3 вкладки · A задача · N дата · D удалить · Esc скрыть' if not self.alarm_id and self.tab != 2 else 'Esc скрыть · N таймер · M Pomodoro · Space пауза · D стоп' if not self.alarm_id else 'Enter завершить / продолжить · S/N отложить · Esc выключить', curses.color_pair(5))
+        if self.alarm_id:
+            hints = 'Enter завершить / продолжить · S/N отложить · Esc выключить'
+        elif self.tab != 2:
+            hints = 'Tab / 1–3 вкладки · A задача · N дата · D удалить · Esc скрыть'
+        elif self.timer_enabled:
+            hints = 'Esc скрыть · N таймер · M Pomodoro · Space пауза · D стоп'
+        else:
+            hints = 'Tab / 1–3 вкладки · Таймер доступен в графической сессии · Esc скрыть'
+        if not self.scratchpad:
+            hints = hints.replace('скрыть', 'закрыть')
+        self.put(height - 1, 2, hints, curses.color_pair(5))
         try:
             curses.curs_set(1 if self.form else 0)
         except curses.error:
@@ -545,7 +566,8 @@ class Panel:
             second = int(time.time())
             if second != self.last_second:
                 try:
-                    self.timer = request()
+                    if self.timer_enabled:
+                        self.timer = request()
                     if self.agenda:
                         self.agenda.reload()
                         self.agenda_error = ''
@@ -578,11 +600,18 @@ def main():
     group.add_argument('--tui', action='store_true', help='Открыть в текущем терминале')
     group.add_argument('--daemon', action='store_true', help='Фоновый процесс таймера')
     group.add_argument('--alarm', metavar='ID', help=argparse.SUPPRESS)
+    group.add_argument('--pause-and-stop', action='store_true', help='Приостановить таймер и завершить его daemon')
     parser.add_argument('--scratchpad', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args()
-    if args.daemon:
+    if args.pause_and_stop:
+        pause_and_stop()
+    elif args.daemon:
+        if console_mode():
+            raise RuntimeError('Daemon таймера не запускается в консольном режиме')
         serve(alarm_callback)
     elif args.tui or args.alarm:
+        if args.alarm and console_mode():
+            raise RuntimeError('Графическое напоминание недоступно в консоли')
         locale.setlocale(locale.LC_ALL, '')
         def tui(screen):
             panel = Panel(screen, scratchpad=args.scratchpad, alarm_id=args.alarm or '')
@@ -609,6 +638,6 @@ if __name__ == '__main__':
         pass
     except (OSError, ValueError, RuntimeError, StopIteration, curses.error) as error:
         print('calendar-popup: ' + clean(error), file=sys.stderr)
-        if '--daemon' not in sys.argv and '--tui' not in sys.argv:
+        if '--daemon' not in sys.argv and '--tui' not in sys.argv and not console_mode():
             subprocess.run(['notify-send', '-u', 'critical', 'Calendar', clean(error)], check=False)
         sys.exit(1)

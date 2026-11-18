@@ -13,7 +13,12 @@ if [[ -e /usr/share/zsh/manjaro-zsh-prompt ]]; then
   source /usr/share/zsh/manjaro-zsh-prompt
 fi
 
-fastfetch
+# Пользовательские обёртки доступны также в чистой TTY-сессии.
+typeset -U path PATH
+path=("$HOME/.local/bin" $path)
+if [[ -o interactive && -t 1 ]]; then
+  "$HOME/.local/bin/fastfetch"
+fi
 
 alias vim='nvim'
 alias usamg1t-run='source "$HOME/.usamg1t/bin/activate"'

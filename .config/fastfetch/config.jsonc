@@ -4,6 +4,7 @@
     "type": "kitty",
     "source": "\"$(\"${XDG_CONFIG_HOME:-$HOME/.config}/fastfetch/next-logo\")\"",
     "width": 32,
+    "color": { "1": "green", "2": "white", "3": "blue" },
     "padding": {
       "right": 3
     }

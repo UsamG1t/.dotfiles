@@ -16,7 +16,7 @@ SDDM_THEME_DIR = Path("/usr/share/sddm/themes/sddm-astronaut-theme")
 PYTHON_SETUP = REPO_DIR / "setup/python-env.py"
 
 HYPRLAND_SCRIPTS = (
-    "calendar-popup", "firefox-here", "lock-screen", "notifications-status",
+    "calendar-popup", "firefox-here", "gui-off", "gui-on", "lock-screen", "notifications-status",
     "screenshot", "send-home-or-other", "show-hints", "sublime-here",
     "thunderbird-here", "toggle-bluetooth", "toggle-btop", "toggle-scratchpad", "tailscale-panel",
     "wallpaper-daemon", "window-double", "window-half",

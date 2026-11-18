@@ -1,0 +1,10 @@
+#!/usr/bin/env python3
+"""Перейти из графической сессии в консоль без перезагрузки."""
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'lib'))
+from gui_mode import main
+
+if __name__ == '__main__':
+    main('off')

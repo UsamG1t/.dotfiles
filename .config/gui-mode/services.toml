@@ -1,0 +1,17 @@
+# gui-off --strict: только временная остановка, без disable и изменений загрузки.
+[system]
+units = ["rtkit-daemon.service", "bluetooth.service", "ModemManager.service"]
+
+[user]
+units = [
+  "pipewire.socket", "pipewire-pulse.socket",
+  "pipewire.service", "pipewire-pulse.service", "wireplumber.service",
+]
+
+# Возвращаются после входа в новую графическую сессию и обновления её окружения.
+[graphical]
+units = [
+  "xdg-desktop-portal.service", "xdg-desktop-portal-gtk.service",
+  "xdg-desktop-portal-hyprland.service", "xdg-document-portal.service",
+  "xdg-permission-store.service", "at-spi-dbus-bus.service",
+]

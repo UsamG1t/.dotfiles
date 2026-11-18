@@ -1,6 +1,7 @@
 -- ~/.config/hypr/modules/startup.lua
 
 hl.on("hyprland.start", function()
+    hl.exec_cmd("gui-on --session-ready")
     hl.exec_cmd("awww-daemon")
     hl.exec_cmd("wallpaper-daemon")
     hl.exec_cmd("/usr/bin/lxqt-policykit-agent")
